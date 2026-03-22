@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -9,6 +9,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
+import { Skeleton } from "@/components/ui/skeleton"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -20,8 +21,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog"
 import { toast } from "sonner"
-import { Plus, Trash2, Pencil, UserCheck, UserX } from "lucide-react"
-import { CUSTOMER_ROLES } from "@/lib/constants"
+import { Plus, Trash2, Pencil, UserCheck, UserX, Search, Filter, X } from "lucide-react"
 
 interface CustomerUsersListProps {
   customerId: string
@@ -30,10 +30,17 @@ interface CustomerUsersListProps {
 
 export function CustomerUsersList({ customerId, userRole }: CustomerUsersListProps) {
   const [users, setUsers] = useState<any[]>([])
+  const [filteredUsers, setFilteredUsers] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
   const [selectedUser, setSelectedUser] = useState<any>(null)
+
+  // Filters
+  const [searchQuery, setSearchQuery] = useState("")
+  const [roleFilter, setRoleFilter] = useState("all")
+  const [statusFilter, setStatusFilter] = useState("all")
+
   const [formData, setFormData] = useState({
     full_name: "",
     email: "",
@@ -52,6 +59,39 @@ export function CustomerUsersList({ customerId, userRole }: CustomerUsersListPro
     fetchUsers()
   }, [customerId])
 
+  useEffect(() => {
+    applyFilters()
+  }, [users, searchQuery, roleFilter, statusFilter])
+
+  const applyFilters = () => {
+    let filtered = [...users]
+
+    // Search filter
+    if (searchQuery.trim()) {
+      const query = searchQuery.toLowerCase()
+      filtered = filtered.filter(
+        (user) =>
+          user.full_name?.toLowerCase().includes(query) ||
+          user.email?.toLowerCase().includes(query) ||
+          user.mobile_number?.toLowerCase().includes(query)
+      )
+    }
+
+    // Role filter
+    if (roleFilter !== "all") {
+      filtered = filtered.filter(u => u.role === roleFilter)
+    }
+
+    // Status filter
+    if (statusFilter !== "all") {
+      filtered = filtered.filter(u => 
+        statusFilter === "active" ? u.is_active : !u.is_active
+      )
+    }
+
+    setFilteredUsers(filtered)
+  }
+
   const fetchUsers = async () => {
     try {
       const response = await fetch(`/api/customers/${customerId}/users`, {
@@ -60,6 +100,7 @@ export function CustomerUsersList({ customerId, userRole }: CustomerUsersListPro
       if (response.ok) {
         const data = await response.json()
         setUsers(data)
+        setFilteredUsers(data)
       }
     } catch (error) {
       console.error("Failed to fetch customer users:", error)
@@ -182,17 +223,47 @@ export function CustomerUsersList({ customerId, userRole }: CustomerUsersListPro
     setIsEditDialogOpen(true)
   }
 
+  const clearFilters = () => {
+    setSearchQuery("")
+    setRoleFilter("all")
+    setStatusFilter("all")
+  }
+
+  const hasActiveFilters = searchQuery || roleFilter !== "all" || statusFilter !== "all"
+
   const canManageUsers = ["super_admin", "admin", "manager"].includes(userRole)
   const canDeleteUsers = userRole === "super_admin"
 
   if (loading) {
-    return <div>Loading users...</div>
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Customer Users</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex flex-wrap gap-4">
+            <Skeleton className="h-10 flex-1 min-w-[200px]" />
+            <Skeleton className="h-10 w-[120px]" />
+          </div>
+          <div className="space-y-2">
+            {[1, 2, 3].map((i) => (
+              <Skeleton key={i} className="h-14 w-full" />
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    )
   }
 
   return (
     <Card>
-      <CardHeader className="flex flex-row items-center justify-between">
-        <CardTitle>Customer Users</CardTitle>
+      <CardHeader className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <CardTitle>Customer Users</CardTitle>
+          <CardDescription>
+            {filteredUsers.length} of {users.length} users
+          </CardDescription>
+        </div>
         {canManageUsers && (
           <Dialog open={isAddDialogOpen} onOpenChange={setIsAddDialogOpen}>
             <DialogTrigger asChild>
@@ -267,91 +338,132 @@ export function CustomerUsersList({ customerId, userRole }: CustomerUsersListPro
           </Dialog>
         )}
       </CardHeader>
-      <CardContent>
-        {users.length === 0 ? (
-          <div className="text-center py-8 text-muted-foreground">No users found for this customer</div>
+      <CardContent className="space-y-4">
+        {/* Filters */}
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="relative flex-1 min-w-[180px]">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+            <Input
+              placeholder="Search users..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="pl-9"
+            />
+          </div>
+          <Select value={roleFilter} onValueChange={setRoleFilter}>
+            <SelectTrigger className="w-[130px]">
+              <SelectValue placeholder="Role" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All Roles</SelectItem>
+              <SelectItem value="customer_admin">Admin</SelectItem>
+              <SelectItem value="customer_agent">Agent</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select value={statusFilter} onValueChange={setStatusFilter}>
+            <SelectTrigger className="w-[120px]">
+              <SelectValue placeholder="Status" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All Status</SelectItem>
+              <SelectItem value="active">Active</SelectItem>
+              <SelectItem value="inactive">Inactive</SelectItem>
+            </SelectContent>
+          </Select>
+          {hasActiveFilters && (
+            <Button variant="ghost" size="sm" onClick={clearFilters} className="gap-1">
+              <X className="h-4 w-4" />
+              Clear
+            </Button>
+          )}
+        </div>
+
+        {filteredUsers.length === 0 ? (
+          <div className="text-center py-8 text-muted-foreground">
+            {hasActiveFilters ? "No users match your filters" : "No users found for this customer"}
+          </div>
         ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Name</TableHead>
-                <TableHead>Email</TableHead>
-                <TableHead>Mobile</TableHead>
-                <TableHead>Role</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Created</TableHead>
-                {canManageUsers && <TableHead>Actions</TableHead>}
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {users.map((user) => (
-                <TableRow key={user.id}>
-                  <TableCell className="font-medium">{user.full_name}</TableCell>
-                  <TableCell>{user.email}</TableCell>
-                  <TableCell>{user.mobile_number}</TableCell>
-                  <TableCell>
-                    <Badge variant="outline">
-                      {user.role === "customer_admin" ? "Admin" : "Agent"}
-                    </Badge>
-                  </TableCell>
-                  <TableCell>
-                    <Badge className={user.is_active ? "bg-green-100 text-green-800" : "bg-red-100 text-red-800"}>
-                      {user.is_active ? "Active" : "Inactive"}
-                    </Badge>
-                  </TableCell>
-                  <TableCell>{new Date(user.created_at).toLocaleDateString()}</TableCell>
-                  {canManageUsers && (
-                    <TableCell>
-                      <div className="flex gap-2">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="gap-1 bg-transparent"
-                          onClick={() => openEditDialog(user)}
-                        >
-                          <Pencil size={14} />
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="gap-1 bg-transparent"
-                          onClick={() => handleToggleStatus(user)}
-                        >
-                          {user.is_active ? <UserX size={14} /> : <UserCheck size={14} />}
-                        </Button>
-                        {canDeleteUsers && (
-                          <AlertDialog>
-                            <AlertDialogTrigger asChild>
-                              <Button variant="destructive" size="sm" className="gap-1">
-                                <Trash2 size={14} />
-                              </Button>
-                            </AlertDialogTrigger>
-                            <AlertDialogContent>
-                              <AlertDialogHeader>
-                                <AlertDialogTitle>Delete User</AlertDialogTitle>
-                                <AlertDialogDescription>
-                                  Are you sure you want to delete {user.full_name}? This action cannot be undone.
-                                </AlertDialogDescription>
-                              </AlertDialogHeader>
-                              <div className="flex gap-4 justify-end">
-                                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                                <AlertDialogAction
-                                  onClick={() => handleDeleteUser(user.id, user.full_name)}
-                                  className="bg-destructive"
-                                >
-                                  Delete
-                                </AlertDialogAction>
-                              </div>
-                            </AlertDialogContent>
-                          </AlertDialog>
-                        )}
-                      </div>
-                    </TableCell>
-                  )}
+          <div className="rounded-lg border overflow-hidden">
+            <Table>
+              <TableHeader>
+                <TableRow className="bg-muted/50 hover:bg-muted/50">
+                  <TableHead className="font-semibold">Name</TableHead>
+                  <TableHead className="font-semibold hidden sm:table-cell">Email</TableHead>
+                  <TableHead className="font-semibold hidden md:table-cell">Mobile</TableHead>
+                  <TableHead className="font-semibold">Role</TableHead>
+                  <TableHead className="font-semibold">Status</TableHead>
+                  {canManageUsers && <TableHead className="font-semibold">Actions</TableHead>}
                 </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+              </TableHeader>
+              <TableBody>
+                {filteredUsers.map((user) => (
+                  <TableRow key={user.id}>
+                    <TableCell className="font-medium">{user.full_name}</TableCell>
+                    <TableCell className="hidden sm:table-cell">{user.email}</TableCell>
+                    <TableCell className="hidden md:table-cell">{user.mobile_number}</TableCell>
+                    <TableCell>
+                      <Badge variant="outline">
+                        {user.role === "customer_admin" ? "Admin" : "Agent"}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>
+                      <Badge className={user.is_active ? "bg-green-100 text-green-800" : "bg-red-100 text-red-800"}>
+                        {user.is_active ? "Active" : "Inactive"}
+                      </Badge>
+                    </TableCell>
+                    {canManageUsers && (
+                      <TableCell>
+                        <div className="flex gap-1">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 w-8 p-0"
+                            onClick={() => openEditDialog(user)}
+                          >
+                            <Pencil size={14} />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 w-8 p-0"
+                            onClick={() => handleToggleStatus(user)}
+                          >
+                            {user.is_active ? <UserX size={14} /> : <UserCheck size={14} />}
+                          </Button>
+                          {canDeleteUsers && (
+                            <AlertDialog>
+                              <AlertDialogTrigger asChild>
+                                <Button variant="ghost" size="sm" className="h-8 w-8 p-0 text-destructive hover:text-destructive">
+                                  <Trash2 size={14} />
+                                </Button>
+                              </AlertDialogTrigger>
+                              <AlertDialogContent>
+                                <AlertDialogHeader>
+                                  <AlertDialogTitle>Delete User</AlertDialogTitle>
+                                  <AlertDialogDescription>
+                                    Are you sure you want to delete {user.full_name}? This action cannot be undone.
+                                  </AlertDialogDescription>
+                                </AlertDialogHeader>
+                                <div className="flex gap-4 justify-end">
+                                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                                  <AlertDialogAction
+                                    onClick={() => handleDeleteUser(user.id, user.full_name)}
+                                    className="bg-destructive"
+                                  >
+                                    Delete
+                                  </AlertDialogAction>
+                                </div>
+                              </AlertDialogContent>
+                            </AlertDialog>
+                          )}
+                        </div>
+                      </TableCell>
+                    )}
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
         )}
       </CardContent>
 

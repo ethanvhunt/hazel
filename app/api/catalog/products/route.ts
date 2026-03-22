@@ -29,6 +29,8 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url)
     const categorySlug = searchParams.get("category")
     const status = searchParams.get("status")
+    const condition = searchParams.get("condition")
+    const brand = searchParams.get("brand")
     const search = searchParams.get("search")
 
     // Build query
@@ -47,11 +49,24 @@ export async function GET(request: Request) {
       query.status = status
     }
 
+    // Handle condition filter
+    if (condition && condition !== "all") {
+      query.condition = condition
+    }
+
+    // Handle brand filter
+    if (brand && brand !== "all") {
+      query.brand = { $regex: brand, $options: "i" }
+    }
+
     // Handle search
     if (search) {
       query.$or = [
         { name: { $regex: search, $options: "i" } },
         { product_code: { $regex: search, $options: "i" } },
+        { brand: { $regex: search, $options: "i" } },
+        { model: { $regex: search, $options: "i" } },
+        { serial_number: { $regex: search, $options: "i" } },
       ]
     }
 
@@ -96,7 +111,28 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json()
-    const { name, description, category_id, brand, model, serial_number, specifications, status } = body
+    const {
+      name,
+      description,
+      category_id,
+      brand,
+      model,
+      manufacturer,
+      serial_number,
+      part_number,
+      sku,
+      asset_tag,
+      condition,
+      warranty_months,
+      warranty_info,
+      purchase_date,
+      purchase_price,
+      vendor,
+      location,
+      notes,
+      specifications,
+      status,
+    } = body
 
     if (!name) {
       return NextResponse.json({ message: "Name is required" }, { status: 400 })
@@ -113,7 +149,19 @@ export async function POST(request: Request) {
       category_id: category_id || null,
       brand: brand || null,
       model: model || null,
+      manufacturer: manufacturer || null,
       serial_number: serial_number || null,
+      part_number: part_number || null,
+      sku: sku || null,
+      asset_tag: asset_tag || null,
+      condition: condition || "new",
+      warranty_months: warranty_months || null,
+      warranty_info: warranty_info || null,
+      purchase_date: purchase_date || null,
+      purchase_price: purchase_price || null,
+      vendor: vendor || null,
+      location: location || null,
+      notes: notes || null,
       specifications: specifications || {},
       status: status || "active",
       created_by: sessionData.userId,

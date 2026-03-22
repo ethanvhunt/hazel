@@ -1,6 +1,8 @@
 import connectDB from "@/lib/mongodb"
 import Customer from "@/models/Customer"
 import CustomerUser from "@/models/CustomerUser"
+import CustomerProduct from "@/models/CustomerProduct"
+import Product from "@/models/Product"
 import { logActivity } from "@/lib/activity-logger"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
@@ -26,7 +28,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "Unauthorized" }, { status: 403 })
     }
 
-    const { companyName, contactPerson, email, phone, customerAdmin, customerAgents } = await request.json()
+    const { companyName, contactPerson, email, phone, customerAdmin, customerAgents, productIds } = await request.json()
 
     if (!companyName || !contactPerson || !email) {
       return NextResponse.json({ message: "Missing required fields" }, { status: 400 })
@@ -111,6 +113,48 @@ export async function POST(request: Request) {
       }
     }
 
+    // Assign products if provided
+    let productsAssigned = 0
+    if (productIds && Array.isArray(productIds) && productIds.length > 0) {
+      for (const productId of productIds) {
+        try {
+          // Check if product exists
+          const product = await Product.findById(productId)
+          if (product) {
+            // Check if assignment already exists
+            const existingAssignment = await CustomerProduct.findOne({
+              customer_id: customer._id,
+              product_id: productId,
+            })
+            
+            if (!existingAssignment) {
+              await CustomerProduct.create({
+                customer_id: customer._id,
+                product_id: productId,
+                assigned_by: session.userId,
+                status: "active",
+              })
+              productsAssigned++
+
+              // Log product assignment
+              await logActivity({
+                entityType: "customer_product",
+                entityId: customer._id,
+                action: "assign",
+                performedBy: session.userId,
+                performedByType: "user",
+                performedByName: session.fullName,
+                newValues: { product_id: productId, product_code: product.product_code },
+                details: `Assigned product ${product.product_code} to customer ${companyName}`,
+              })
+            }
+          }
+        } catch (err) {
+          console.error(`[v0] Error assigning product ${productId}:`, err)
+        }
+      }
+    }
+
     // Log activity
     await logActivity({
       entityType: "customer",
@@ -124,6 +168,7 @@ export async function POST(request: Request) {
         contact_person: contactPerson,
         email,
         customer_users_created: (adminUser ? 1 : 0) + agentUsers.length,
+        products_assigned: productsAssigned,
       },
       details: `Created customer ${companyName}`,
     })
@@ -141,6 +186,7 @@ export async function POST(request: Request) {
         },
         generatedPassword,
         customerUsersCreated: (adminUser ? 1 : 0) + agentUsers.length,
+        productsAssigned,
       },
       { status: 201 },
     )
