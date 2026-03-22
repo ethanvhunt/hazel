@@ -1,4 +1,6 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { ProductRequest, Customer, User } from "@/models"
+import { logActivity } from "@/lib/activity-logger"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 
@@ -15,24 +17,57 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url)
     const customerId = searchParams.get("customerId")
 
-    let requests
+    await connectToDatabase()
+
+    let requests: any[]
+    
     if (customerId) {
-      requests = await sql`
-        SELECT pr.*, c.company_name
-        FROM product_requests pr
-        JOIN customers c ON pr.customer_id = c.id
-        WHERE pr.customer_id = ${customerId}
-        ORDER BY pr.created_at DESC
-      `
+      requests = await ProductRequest.find({ customerId }).sort({ createdAt: -1 }).lean()
+      const customer = await Customer.findById(customerId).lean()
+      
+      requests = requests.map((r: any) => ({
+        id: r._id.toString(),
+        customer_id: r.customerId,
+        product_name: r.productName,
+        description: r.description,
+        status: r.status,
+        reviewed_by: r.reviewedBy,
+        review_notes: r.reviewNotes,
+        created_at: r.createdAt,
+        updated_at: r.updatedAt,
+        company_name: (customer as any)?.companyName,
+      }))
     } else {
       // Fetch all requests for team members
-      requests = await sql`
-        SELECT pr.*, c.company_name, u.full_name as reviewer_name
-        FROM product_requests pr
-        JOIN customers c ON pr.customer_id = c.id
-        LEFT JOIN users u ON pr.reviewed_by = u.id
-        ORDER BY pr.created_at DESC
-      `
+      requests = await ProductRequest.find().sort({ createdAt: -1 }).lean()
+      
+      // Get customer and reviewer info
+      const customerIds = [...new Set(requests.map((r: any) => r.customerId))]
+      const reviewerIds = [...new Set(requests.filter((r: any) => r.reviewedBy).map((r: any) => r.reviewedBy))]
+      
+      const customers = await Customer.find({ _id: { $in: customerIds } }).lean()
+      const reviewers = await User.find({ _id: { $in: reviewerIds } }).lean()
+      
+      const customerMap = new Map(customers.map((c: any) => [c._id.toString(), c]))
+      const reviewerMap = new Map(reviewers.map((r: any) => [r._id.toString(), r]))
+
+      requests = requests.map((r: any) => {
+        const customer = customerMap.get(r.customerId)
+        const reviewer = reviewerMap.get(r.reviewedBy)
+        return {
+          id: r._id.toString(),
+          customer_id: r.customerId,
+          product_name: r.productName,
+          description: r.description,
+          status: r.status,
+          reviewed_by: r.reviewedBy,
+          review_notes: r.reviewNotes,
+          created_at: r.createdAt,
+          updated_at: r.updatedAt,
+          company_name: (customer as any)?.companyName,
+          reviewer_name: (reviewer as any)?.fullName,
+        }
+      })
     }
 
     return NextResponse.json(requests)
@@ -70,18 +105,32 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "Missing required fields" }, { status: 400 })
     }
 
-    const result = await sql`
-      INSERT INTO product_requests (customer_id, product_name, description, status)
-      VALUES (${customerId}, ${productName}, ${description}, 'pending')
-      RETURNING *
-    `
+    await connectToDatabase()
 
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, new_values)
-      VALUES ('product_request', ${result[0].id}, 'create', ${customerId}, ${JSON.stringify({ productName, description })})
-    `
+    const newRequest = await ProductRequest.create({
+      customerId,
+      productName,
+      description,
+      status: "pending",
+    })
 
-    return NextResponse.json(result[0], { status: 201 })
+    await logActivity({
+      entityType: "product_request",
+      entityId: newRequest._id.toString(),
+      action: "create",
+      performedBy: customerId,
+      performedByType: "customer",
+      newValues: { productName, description },
+    })
+
+    return NextResponse.json({
+      id: newRequest._id.toString(),
+      customer_id: newRequest.customerId,
+      product_name: newRequest.productName,
+      description: newRequest.description,
+      status: newRequest.status,
+      created_at: newRequest.createdAt,
+    }, { status: 201 })
   } catch (error) {
     console.error("[v0] Error creating product request:", error)
     return NextResponse.json({ message: "Error creating product request" }, { status: 500 })

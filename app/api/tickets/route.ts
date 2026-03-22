@@ -1,12 +1,23 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import Ticket from "@/models/Ticket"
+import CustomerUser from "@/models/CustomerUser"
+import CustomerAgentAssignment from "@/models/CustomerAgentAssignment"
+import User from "@/models/User"
+import Customer from "@/models/Customer"
+import Notification from "@/models/Notification"
+import { getNextSequence } from "@/models/Counter"
+import { logActivity } from "@/lib/activity-logger"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 import { ROLES, TICKET_STATUS } from "@/lib/constants"
 import { sendTicketEmail } from "@/lib/email-service"
 import { sendSMS, formatTicketCreatedSMS, formatTicketApprovedSMS } from "@/lib/sms"
+import mongoose from "mongoose"
 
 export async function GET(request: Request) {
   try {
+    await connectDB()
+    
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")
     const customerSession = cookieStore.get("customer-session")
@@ -36,177 +47,99 @@ export async function GET(request: Request) {
     const status = searchParams.get("status")
     const pendingApproval = searchParams.get("pendingApproval")
 
+    let query: any = {}
     let tickets
 
     if (userType === "customer") {
-      // Customer users can only see their own company's tickets
       const custId = sessionData.customerId
-      
-      // customer_agent can only see approved/open tickets, not pending_approval (unless they created them)
-      // customer_admin can see all including pending_approval
+      query.customer_id = new mongoose.Types.ObjectId(custId)
+
       if (sessionData.role === "customer_agent") {
+        // customer_agent can only see approved/open tickets, not pending_approval (unless they created them)
         if (status) {
-          tickets = await sql`
-            SELECT t.*, cp.name as product_name, cp.product_code, c.company_name,
-                   u.full_name as assigned_to_name
-            FROM tickets t
-            LEFT JOIN catalog_products cp ON t.product_id = cp.id
-            LEFT JOIN customers c ON t.customer_id = c.id
-            LEFT JOIN users u ON t.assigned_agent_id = u.id
-            WHERE t.customer_id = ${custId} 
-              AND t.status = ${status}
-              AND (t.status != 'pending_approval' OR t.created_by_customer_user = ${sessionData.userId})
-            ORDER BY t.created_at DESC
-          `
+          query.status = status
+          query.$or = [
+            { status: { $ne: "pending_approval" } },
+            { created_by_customer_user: new mongoose.Types.ObjectId(sessionData.userId) },
+          ]
         } else {
-          tickets = await sql`
-            SELECT t.*, cp.name as product_name, cp.product_code, c.company_name,
-                   u.full_name as assigned_to_name
-            FROM tickets t
-            LEFT JOIN catalog_products cp ON t.product_id = cp.id
-            LEFT JOIN customers c ON t.customer_id = c.id
-            LEFT JOIN users u ON t.assigned_agent_id = u.id
-            WHERE t.customer_id = ${custId}
-              AND (t.status != 'pending_approval' OR t.created_by_customer_user = ${sessionData.userId})
-            ORDER BY t.created_at DESC
-          `
+          query.$or = [
+            { status: { $ne: "pending_approval" } },
+            { created_by_customer_user: new mongoose.Types.ObjectId(sessionData.userId) },
+          ]
         }
       } else {
-        // customer_admin or regular customer login can see all tickets
+        // customer_admin can see all
         if (pendingApproval === "true") {
-          tickets = await sql`
-            SELECT t.*, cp.name as product_name, cp.product_code, c.company_name, cu.full_name as created_by_name,
-                   u.full_name as assigned_to_name
-            FROM tickets t
-            LEFT JOIN catalog_products cp ON t.product_id = cp.id
-            LEFT JOIN customers c ON t.customer_id = c.id
-            LEFT JOIN customer_users cu ON t.created_by_customer_user = cu.id
-            LEFT JOIN users u ON t.assigned_agent_id = u.id
-            WHERE t.customer_id = ${custId} AND t.status = 'pending_approval'
-            ORDER BY t.created_at DESC
-          `
+          query.status = "pending_approval"
         } else if (status) {
-          tickets = await sql`
-            SELECT t.*, cp.name as product_name, cp.product_code, c.company_name,
-                   u.full_name as assigned_to_name
-            FROM tickets t
-            LEFT JOIN catalog_products cp ON t.product_id = cp.id
-            LEFT JOIN customers c ON t.customer_id = c.id
-            LEFT JOIN users u ON t.assigned_agent_id = u.id
-            WHERE t.customer_id = ${custId} AND t.status = ${status}
-            ORDER BY t.created_at DESC
-          `
-        } else {
-          tickets = await sql`
-            SELECT t.*, cp.name as product_name, cp.product_code, c.company_name,
-                   u.full_name as assigned_to_name
-            FROM tickets t
-            LEFT JOIN catalog_products cp ON t.product_id = cp.id
-            LEFT JOIN customers c ON t.customer_id = c.id
-            LEFT JOIN users u ON t.assigned_agent_id = u.id
-            WHERE t.customer_id = ${custId}
-            ORDER BY t.created_at DESC
-          `
+          query.status = status
         }
       }
+
+      tickets = await Ticket.find(query)
+        .populate("product_id", "name product_code")
+        .populate("customer_id", "company_name")
+        .populate("assigned_agent_id", "full_name")
+        .populate("created_by_customer_user", "full_name")
+        .sort({ created_at: -1 })
+        .lean()
+
     } else if (sessionData.role === ROLES.AGENT) {
-      // Team agents only see tickets that are open (approved) and assigned to customers they manage
-      const assignedCustomers = await sql`
-        SELECT customer_id FROM customer_agent_assignment WHERE agent_id = ${sessionData.userId}
-      `
-      const customerIds = assignedCustomers.map((row: any) => row.customer_id)
+      // Team agents only see tickets for assigned customers
+      const assignments = await CustomerAgentAssignment.find({ agent_id: sessionData.userId })
+      const customerIds = assignments.map((a: any) => a.customer_id)
 
       if (customerIds.length === 0) {
         return NextResponse.json([])
       }
 
-      // Agents should NOT see pending_approval tickets
+      query.customer_id = { $in: customerIds }
+      query.status = { $nin: ["pending_approval", "rejected"] }
+
       if (status) {
-        tickets = await sql`
-          SELECT t.*, cp.name as product_name, cp.product_code, c.company_name,
-                 u.full_name as assigned_to_name
-          FROM tickets t
-          LEFT JOIN catalog_products cp ON t.product_id = cp.id
-          LEFT JOIN customers c ON t.customer_id = c.id
-          LEFT JOIN users u ON t.assigned_agent_id = u.id
-          WHERE t.customer_id = ANY(${customerIds}) 
-            AND t.status = ${status}
-            AND t.status NOT IN ('pending_approval', 'rejected')
-          ORDER BY t.created_at DESC
-        `
-      } else {
-        tickets = await sql`
-          SELECT t.*, cp.name as product_name, cp.product_code, c.company_name,
-                 u.full_name as assigned_to_name
-          FROM tickets t
-          LEFT JOIN catalog_products cp ON t.product_id = cp.id
-          LEFT JOIN customers c ON t.customer_id = c.id
-          LEFT JOIN users u ON t.assigned_agent_id = u.id
-          WHERE t.customer_id = ANY(${customerIds})
-            AND t.status NOT IN ('pending_approval', 'rejected')
-          ORDER BY t.created_at DESC
-        `
+        query.status = status
       }
+
+      tickets = await Ticket.find(query)
+        .populate("product_id", "name product_code")
+        .populate("customer_id", "company_name")
+        .populate("assigned_agent_id", "full_name")
+        .sort({ created_at: -1 })
+        .lean()
+
     } else {
       // Super admin, admin, manager can see all tickets
-      if (customerId && status) {
-        tickets = await sql`
-          SELECT t.*, cp.name as product_name, cp.product_code, c.company_name,
-                 u.full_name as assigned_to_name
-          FROM tickets t
-          LEFT JOIN catalog_products cp ON t.product_id = cp.id
-          LEFT JOIN customers c ON t.customer_id = c.id
-          LEFT JOIN users u ON t.assigned_agent_id = u.id
-          WHERE t.customer_id = ${customerId} AND t.status = ${status}
-          ORDER BY t.created_at DESC
-        `
-      } else if (customerId) {
-        tickets = await sql`
-          SELECT t.*, cp.name as product_name, cp.product_code, c.company_name,
-                 u.full_name as assigned_to_name
-          FROM tickets t
-          LEFT JOIN catalog_products cp ON t.product_id = cp.id
-          LEFT JOIN customers c ON t.customer_id = c.id
-          LEFT JOIN users u ON t.assigned_agent_id = u.id
-          WHERE t.customer_id = ${customerId}
-          ORDER BY t.created_at DESC
-        `
-      } else if (agentId) {
-        tickets = await sql`
-          SELECT t.*, cp.name as product_name, cp.product_code, c.company_name,
-                 u.full_name as assigned_to_name
-          FROM tickets t
-          LEFT JOIN catalog_products cp ON t.product_id = cp.id
-          LEFT JOIN customers c ON t.customer_id = c.id
-          LEFT JOIN users u ON t.assigned_agent_id = u.id
-          WHERE t.assigned_agent_id = ${agentId}
-          ORDER BY t.created_at DESC
-        `
-      } else if (status) {
-        tickets = await sql`
-          SELECT t.*, cp.name as product_name, cp.product_code, c.company_name,
-                 u.full_name as assigned_to_name
-          FROM tickets t
-          LEFT JOIN catalog_products cp ON t.product_id = cp.id
-          LEFT JOIN customers c ON t.customer_id = c.id
-          LEFT JOIN users u ON t.assigned_agent_id = u.id
-          WHERE t.status = ${status}
-          ORDER BY t.created_at DESC
-        `
-      } else {
-        tickets = await sql`
-          SELECT t.*, cp.name as product_name, cp.product_code, c.company_name,
-                 u.full_name as assigned_to_name
-          FROM tickets t
-          LEFT JOIN catalog_products cp ON t.product_id = cp.id
-          LEFT JOIN customers c ON t.customer_id = c.id
-          LEFT JOIN users u ON t.assigned_agent_id = u.id
-          ORDER BY t.created_at DESC
-        `
+      if (customerId) {
+        query.customer_id = new mongoose.Types.ObjectId(customerId)
       }
+      if (agentId) {
+        query.assigned_agent_id = new mongoose.Types.ObjectId(agentId)
+      }
+      if (status) {
+        query.status = status
+      }
+
+      tickets = await Ticket.find(query)
+        .populate("product_id", "name product_code")
+        .populate("customer_id", "company_name")
+        .populate("assigned_agent_id", "full_name")
+        .sort({ created_at: -1 })
+        .lean()
     }
 
-    return NextResponse.json(tickets)
+    // Transform for frontend
+    const transformed = tickets.map((t: any) => ({
+      ...t,
+      id: t._id.toString(),
+      product_name: t.product_id?.name || null,
+      product_code: t.product_id?.product_code || null,
+      company_name: t.customer_id?.company_name || null,
+      assigned_to_name: t.assigned_agent_id?.full_name || null,
+      created_by_name: t.created_by_customer_user?.full_name || null,
+    }))
+
+    return NextResponse.json(transformed)
   } catch (error) {
     console.error("[v0] Error fetching tickets:", error)
     return NextResponse.json({ message: "Error fetching tickets" }, { status: 500 })
@@ -215,6 +148,8 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
+    await connectDB()
+    
     const cookieStore = await cookies()
     const customerSession = cookieStore.get("customer-session")
 
@@ -243,138 +178,148 @@ export async function POST(request: Request) {
     const customerUserId = isCustomerUser ? sessionData.userId : null
     
     // Determine initial status based on who creates the ticket
-    // customer_agent tickets need approval, others go directly to open
     const initialStatus = sessionData.role === "customer_agent" ? TICKET_STATUS.PENDING_APPROVAL : TICKET_STATUS.OPEN
 
-    const result = await sql`
-      INSERT INTO tickets (
-        customer_id, product_id, title, description, priority, status, 
-        created_by_customer_user
-      )
-      VALUES (
-        ${customerId}, ${productId || null}, ${title}, ${description}, 
-        ${priority || "medium"}, ${initialStatus}, ${customerUserId}
-      )
-      RETURNING *
-    `
+    // Generate ticket number
+    const ticketNum = await getNextSequence("ticket_number")
+    const ticketNumber = `TKT-${String(ticketNum).padStart(6, "0")}`
 
-    const ticket = result[0]
+    // Set auto-close time (2 hours from creation for open tickets)
+    const autoCloseAt = initialStatus === TICKET_STATUS.OPEN ? new Date(Date.now() + 2 * 60 * 60 * 1000) : undefined
+
+    const ticket = await Ticket.create({
+      ticket_number: ticketNumber,
+      customer_id: customerId,
+      product_id: productId || null,
+      title,
+      description,
+      priority: priority || "medium",
+      status: initialStatus,
+      created_by_customer_user: customerUserId,
+      auto_close_at: autoCloseAt,
+    })
 
     // Get customer info
-    const customer = await sql`
-      SELECT company_name FROM customers WHERE id = ${customerId}
-    `
+    const customer = await Customer.findById(customerId)
 
     // Get product info if exists
     let productName = "General Inquiry"
     let productCode = ""
     if (productId) {
-      const product = await sql`SELECT name, product_code FROM catalog_products WHERE id = ${productId}`
-      if (product.length > 0) {
-        productName = product[0].name
-        productCode = product[0].product_code
+      const Product = (await import("@/models/Product")).default
+      const product = await Product.findById(productId)
+      if (product) {
+        productName = product.name
+        productCode = product.product_code
       }
     }
 
+    // Log activity
+    await logActivity({
+      entityType: "ticket",
+      entityId: ticket._id,
+      action: "create",
+      performedBy: customerUserId || customerId,
+      performedByType: isCustomerUser ? "customer_user" : "customer",
+      performedByName: sessionData.fullName || sessionData.companyName,
+      newValues: { ticket_number: ticketNumber, title, status: initialStatus },
+      details: `Created ticket ${ticketNumber}: ${title}`,
+    })
+
     if (initialStatus === TICKET_STATUS.PENDING_APPROVAL) {
       // SMS notification to customer_admin for approval
-      const customerAdmins = await sql`
-        SELECT id, full_name, mobile_number FROM customer_users 
-        WHERE customer_id = ${customerId} AND role = 'customer_admin' AND is_active = true
-      `
+      const customerAdmins = await CustomerUser.find({
+        customer_id: customerId,
+        role: "customer_admin",
+        is_active: true,
+      })
 
       for (const admin of customerAdmins) {
         if (admin.mobile_number) {
-          // Send SMS
           await sendSMS({
             to: admin.mobile_number,
             message: formatTicketCreatedSMS(
-              ticket.id.toString().slice(0, 8), 
-              productCode ? `${productCode} - ${productName}` : productName, 
+              ticketNumber,
+              productCode ? `${productCode} - ${productName}` : productName,
               sessionData.fullName || "Agent"
             ),
             type: "ticket_created",
-            relatedId: ticket.id,
+            relatedId: ticket._id.toString(),
           })
         }
 
         // Create notification
-        await sql`
-          INSERT INTO notifications (user_id, user_type, event_type, entity_type, entity_id, title, message, read)
-          VALUES (
-            ${admin.id},
-            'customer_user',
-            'ticket_pending_approval',
-            'ticket',
-            ${ticket.id},
-            'New Ticket Pending Approval',
-            ${"A new ticket \"" + title + "\" requires your approval."},
-            false
-          )
-        `
+        await Notification.create({
+          user_id: admin._id,
+          user_type: "customer_user",
+          event_type: "ticket_pending_approval",
+          entity_type: "ticket",
+          entity_id: ticket._id,
+          title: "New Ticket Pending Approval",
+          message: `A new ticket "${title}" requires your approval.`,
+          read: false,
+        })
       }
 
-      return NextResponse.json({ 
-        ...ticket, 
-        message: "Ticket submitted for approval. Your customer admin will be notified via SMS." 
+      return NextResponse.json({
+        ...ticket.toObject(),
+        id: ticket._id.toString(),
+        message: "Ticket submitted for approval. Your customer admin will be notified via SMS.",
       }, { status: 201 })
     } else {
       // Direct ticket - notify team agent
-      const assignment = await sql`
-        SELECT agent_id FROM customer_agent_assignment WHERE customer_id = ${customerId} LIMIT 1
-      `
+      const assignment = await CustomerAgentAssignment.findOne({ customer_id: customerId })
 
-      if (assignment.length > 0 && assignment[0].agent_id) {
+      if (assignment && assignment.agent_id) {
         try {
-          const agent = await sql`
-            SELECT id, full_name, gmail_address, mobile_number FROM users WHERE id = ${assignment[0].agent_id}
-          `
+          const agent = await User.findById(assignment.agent_id)
 
-          if (agent.length > 0) {
+          if (agent) {
             // Send email if available
-            if (agent[0].gmail_address) {
+            if (agent.gmail_address) {
               await sendTicketEmail(
-                agent[0].gmail_address,
+                agent.gmail_address,
                 title,
                 description,
-                customer[0]?.company_name || "Customer",
-                ticket.id,
+                customer?.company_name || "Customer",
+                ticket._id.toString(),
               )
             }
 
             // Send SMS if mobile available
-            if (agent[0].mobile_number) {
+            if (agent.mobile_number) {
               await sendSMS({
-                to: agent[0].mobile_number,
-                message: `New ticket from ${customer[0]?.company_name}: ${title}. ID: ${ticket.id.toString().slice(0, 8)}`,
+                to: agent.mobile_number,
+                message: `New ticket from ${customer?.company_name}: ${title}. ID: ${ticketNumber}`,
                 type: "ticket_created",
-                relatedId: ticket.id,
+                relatedId: ticket._id.toString(),
               })
             }
 
+            // Update ticket with assigned agent
+            await Ticket.findByIdAndUpdate(ticket._id, { assigned_agent_id: agent._id })
+
             // Create notification
-            await sql`
-              INSERT INTO notifications (user_id, user_type, event_type, entity_type, entity_id, title, message, read)
-              VALUES (
-                ${agent[0].id},
-                'team',
-                'ticket_created',
-                'ticket',
-                ${ticket.id},
-                ${"New Ticket from " + (customer[0]?.company_name || "Customer")},
-                ${"Customer " + (customer[0]?.company_name || "Customer") + " created a new ticket: " + title},
-                false
-              )
-            `
+            await Notification.create({
+              user_id: agent._id,
+              user_type: "team",
+              event_type: "ticket_created",
+              entity_type: "ticket",
+              entity_id: ticket._id,
+              title: `New Ticket from ${customer?.company_name || "Customer"}`,
+              message: `Customer ${customer?.company_name || "Customer"} created a new ticket: ${title}`,
+              read: false,
+            })
           }
         } catch (emailError) {
           console.error("[v0] Failed to send ticket notifications:", emailError)
         }
       }
 
-      return NextResponse.json({ 
-        ...ticket, 
-        message: "Ticket created successfully" 
+      return NextResponse.json({
+        ...ticket.toObject(),
+        id: ticket._id.toString(),
+        message: "Ticket created successfully",
       }, { status: 201 })
     }
   } catch (error) {

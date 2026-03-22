@@ -1,7 +1,15 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import Customer from "@/models/Customer"
+import CustomerUser from "@/models/CustomerUser"
+import CustomerProduct from "@/models/CustomerProduct"
+import CustomerAgentAssignment from "@/models/CustomerAgentAssignment"
+import Ticket from "@/models/Ticket"
+import Message from "@/models/Message"
+import { logActivity } from "@/lib/activity-logger"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 import { ROLES } from "@/lib/constants"
+import mongoose from "mongoose"
 
 async function checkSuperAdminAuth() {
   const cookieStore = await cookies()
@@ -24,6 +32,8 @@ async function checkSuperAdminAuth() {
 
 export async function DELETE(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    await connectDB()
+    
     const { id } = await params
     const session = await checkSuperAdminAuth()
 
@@ -31,31 +41,44 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       return NextResponse.json({ message: "Unauthorized. Only super admin can delete customers." }, { status: 403 })
     }
 
-    const customers = await sql`SELECT * FROM customers WHERE id = ${id}`
-    const customerToDelete = customers[0]
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ message: "Invalid customer ID" }, { status: 400 })
+    }
+
+    const customerToDelete = await Customer.findById(id).lean()
 
     if (!customerToDelete) {
       return NextResponse.json({ message: "Customer not found" }, { status: 404 })
     }
 
-    await sql`DELETE FROM messages WHERE ticket_id IN (SELECT id FROM tickets WHERE customer_id = ${id})`
-    await sql`DELETE FROM tickets WHERE customer_id = ${id}`
-    await sql`DELETE FROM products WHERE customer_id = ${id}`
-    await sql`DELETE FROM product_requests WHERE customer_id = ${id}`
-    await sql`DELETE FROM customer_users WHERE customer_id = ${id}`
-    await sql`DELETE FROM customer_product_assignments WHERE customer_id = ${id}`
+    // Delete all related data
+    const tickets = await Ticket.find({ customer_id: id })
+    const ticketIds = tickets.map(t => t._id)
+    
+    await Message.deleteMany({ ticket_id: { $in: ticketIds } })
+    await Ticket.deleteMany({ customer_id: id })
+    await CustomerUser.deleteMany({ customer_id: id })
+    await CustomerProduct.deleteMany({ customer_id: id })
+    await CustomerAgentAssignment.deleteMany({ customer_id: id })
+    
+    // Delete the customer
+    await Customer.findByIdAndDelete(id)
 
-    await sql`DELETE FROM customers WHERE id = ${id}`
-
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, old_values, new_values)
-      VALUES ('customer', ${id}, 'delete', ${session.id}, ${JSON.stringify({
-        id: customerToDelete.id,
-        companyName: customerToDelete.company_name,
-        contactPerson: customerToDelete.contact_person,
-        email: customerToDelete.email,
-      })}, null)
-    `
+    // Log activity
+    await logActivity({
+      entityType: "customer",
+      entityId: id,
+      action: "delete",
+      performedBy: session.userId,
+      performedByType: "user",
+      performedByName: session.fullName,
+      oldValues: {
+        company_name: (customerToDelete as any).company_name,
+        contact_person: (customerToDelete as any).contact_person,
+        email: (customerToDelete as any).email,
+      },
+      details: `Deleted customer ${(customerToDelete as any).company_name}`,
+    })
 
     return NextResponse.json({ message: "Customer deleted successfully" })
   } catch (error) {
@@ -66,6 +89,8 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
 
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    await connectDB()
+    
     const { id } = await params
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")?.value
@@ -74,38 +99,45 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
       return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
     }
 
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ message: "Invalid customer ID" }, { status: 400 })
+    }
+
     const session = JSON.parse(teamSession)
 
     let customer
     if (session.role === "agent") {
-      const result = await sql`
-        SELECT c.* FROM customers c
-        JOIN customer_agent_assignment ca ON c.id = ca.customer_id
-        WHERE c.id = ${id} AND ca.agent_id = ${session.userId}
-      `
-      if (result.length === 0) {
+      // Check if agent is assigned to this customer
+      const assignment = await CustomerAgentAssignment.findOne({
+        customer_id: id,
+        agent_id: session.userId,
+      })
+      
+      if (!assignment) {
         return NextResponse.json({ message: "Customer not found or unauthorized" }, { status: 404 })
       }
-      customer = result[0]
+      
+      customer = await Customer.findById(id).lean()
     } else {
-      const result = await sql`SELECT * FROM customers WHERE id = ${id}`
-      if (result.length === 0) {
-        return NextResponse.json({ message: "Customer not found" }, { status: 404 })
-      }
-      customer = result[0]
+      customer = await Customer.findById(id).lean()
+    }
+
+    if (!customer) {
+      return NextResponse.json({ message: "Customer not found" }, { status: 404 })
     }
 
     // Fetch assigned agent
-    const assignment = await sql`
-      SELECT u.id, u.full_name FROM customer_agent_assignment ca
-      JOIN users u ON ca.agent_id = u.id
-      WHERE ca.customer_id = ${id}
-      LIMIT 1
-    `
+    const assignment = await CustomerAgentAssignment.findOne({ customer_id: id })
+      .populate("agent_id", "full_name")
+      .lean()
 
     return NextResponse.json({
       ...customer,
-      assigned_agent: assignment.length > 0 ? assignment[0] : null,
+      id: (customer as any)._id.toString(),
+      assigned_agent: assignment ? {
+        id: (assignment as any).agent_id?._id?.toString(),
+        full_name: (assignment as any).agent_id?.full_name,
+      } : null,
     })
   } catch (error) {
     console.error("[v0] Error fetching customer:", error)
@@ -115,6 +147,8 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
 
 export async function PUT(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    await connectDB()
+    
     const { id } = await params
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")?.value
@@ -123,52 +157,63 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
     }
 
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ message: "Invalid customer ID" }, { status: 400 })
+    }
+
     const session = JSON.parse(teamSession)
     const { companyName, contactPerson, phone } = await request.json()
 
     // Fetch current customer
-    const currentResult = await sql`SELECT * FROM customers WHERE id = ${id}`
-    if (currentResult.length === 0) {
+    const currentCustomer = await Customer.findById(id).lean()
+    if (!currentCustomer) {
       return NextResponse.json({ message: "Customer not found" }, { status: 404 })
     }
 
-    const currentCustomer = currentResult[0]
-
     if (session.role === "agent") {
-      const assignment = await sql`
-        SELECT * FROM customer_agent_assignment
-        WHERE customer_id = ${id} AND agent_id = ${session.userId}
-      `
-      if (assignment.length === 0) {
+      const assignment = await CustomerAgentAssignment.findOne({
+        customer_id: id,
+        agent_id: session.userId,
+      })
+      if (!assignment) {
         return NextResponse.json({ message: "Unauthorized" }, { status: 403 })
       }
     }
 
-    const updatedResult = await sql`
-      UPDATE customers 
-      SET company_name = ${companyName || currentCustomer.company_name},
-          contact_person = ${contactPerson || currentCustomer.contact_person},
-          phone = ${phone || currentCustomer.phone}
-      WHERE id = ${id}
-      RETURNING *
-    `
+    const updateData: any = {}
+    if (companyName) updateData.company_name = companyName
+    if (contactPerson) updateData.contact_person = contactPerson
+    if (phone !== undefined) updateData.phone = phone
 
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, old_values, new_values)
-      VALUES ('customer', ${id}, 'update', ${session.userId}, ${JSON.stringify({
-        companyName: currentCustomer.company_name,
-        contactPerson: currentCustomer.contact_person,
-        phone: currentCustomer.phone,
-      })}, ${JSON.stringify({
-        companyName: companyName || currentCustomer.company_name,
-        contactPerson: contactPerson || currentCustomer.contact_person,
-        phone: phone || currentCustomer.phone,
-      })})
-    `
+    const updatedCustomer = await Customer.findByIdAndUpdate(
+      id,
+      { $set: updateData },
+      { new: true }
+    ).lean()
+
+    // Log activity
+    await logActivity({
+      entityType: "customer",
+      entityId: id,
+      action: "update",
+      performedBy: session.userId,
+      performedByType: "user",
+      performedByName: session.fullName,
+      oldValues: {
+        company_name: (currentCustomer as any).company_name,
+        contact_person: (currentCustomer as any).contact_person,
+        phone: (currentCustomer as any).phone,
+      },
+      newValues: updateData,
+      details: `Updated customer ${(updatedCustomer as any).company_name}`,
+    })
 
     return NextResponse.json({
       message: "Customer updated successfully",
-      customer: updatedResult[0],
+      customer: {
+        ...updatedCustomer,
+        id: (updatedCustomer as any)._id.toString(),
+      },
     })
   } catch (error) {
     console.error("[v0] Error updating customer:", error)

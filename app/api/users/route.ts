@@ -1,4 +1,5 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { User } from "@/models"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 import { ROLES } from "@/lib/constants"
@@ -29,66 +30,47 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url)
     const role = searchParams.get("role")
 
-    let users
+    await connectToDatabase()
+
+    let query: any = {}
+    let users: any[]
 
     if (session.role === ROLES.AGENT) {
       // Agents cannot view user list
       return NextResponse.json({ message: "Unauthorized" }, { status: 403 })
     } else if (session.role === ROLES.MANAGER) {
       // Managers can only view agents
-      if (role && role === ROLES.AGENT) {
-        users = await sql`
-          SELECT id, full_name, email, role, created_at
-          FROM users
-          WHERE role = ${ROLES.AGENT}
-          ORDER BY created_at DESC
-        `
-      } else {
-        users = await sql`
-          SELECT id, full_name, email, role, created_at
-          FROM users
-          WHERE role = ${ROLES.AGENT}
-          ORDER BY created_at DESC
-        `
-      }
+      query.role = ROLES.AGENT
     } else if (session.role === ROLES.ADMIN) {
       // Admins can view all users except super admins
+      query.role = { $ne: ROLES.SUPER_ADMIN }
       if (role && [ROLES.ADMIN, ROLES.MANAGER, ROLES.AGENT].includes(role)) {
-        users = await sql`
-          SELECT id, full_name, email, role, created_at
-          FROM users
-          WHERE role != ${ROLES.SUPER_ADMIN} AND role = ${role}
-          ORDER BY created_at DESC
-        `
-      } else {
-        users = await sql`
-          SELECT id, full_name, email, role, created_at
-          FROM users
-          WHERE role != ${ROLES.SUPER_ADMIN}
-          ORDER BY created_at DESC
-        `
+        query.role = role
       }
     } else if (session.role === ROLES.SUPER_ADMIN) {
       // Super admins can view all users
       if (role && [ROLES.SUPER_ADMIN, ROLES.ADMIN, ROLES.MANAGER, ROLES.AGENT].includes(role)) {
-        users = await sql`
-          SELECT id, full_name, email, role, created_at
-          FROM users
-          WHERE role = ${role}
-          ORDER BY created_at DESC
-        `
-      } else {
-        users = await sql`
-          SELECT id, full_name, email, role, created_at
-          FROM users
-          ORDER BY created_at DESC
-        `
+        query.role = role
       }
     } else {
       return NextResponse.json({ message: "Unauthorized" }, { status: 403 })
     }
 
-    return NextResponse.json(users)
+    users = await User.find(query)
+      .select("-passwordHash")
+      .sort({ createdAt: -1 })
+      .lean()
+
+    // Transform for frontend compatibility
+    const transformed = users.map((u: any) => ({
+      id: u._id.toString(),
+      full_name: u.fullName,
+      email: u.email,
+      role: u.role,
+      created_at: u.createdAt,
+    }))
+
+    return NextResponse.json(transformed)
   } catch (error) {
     console.error("[v0] Error fetching users:", error)
     return NextResponse.json({ message: "Error fetching users" }, { status: 500 })

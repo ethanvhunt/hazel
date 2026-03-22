@@ -1,4 +1,5 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { CustomerUser } from "@/models"
 import { hashPassword, verifyPassword } from "@/lib/auth"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
@@ -15,24 +16,23 @@ export async function POST(request: Request) {
     const session = JSON.parse(sessionStr)
     const { oldPassword, newPassword } = await request.json()
 
-    const customer = await sql`
-      SELECT password_hash FROM customers WHERE id = ${session.customerId}
-    `
+    await connectToDatabase()
 
-    if (customer.length === 0) {
-      return NextResponse.json({ message: "Customer not found" }, { status: 404 })
+    const customerUser = await CustomerUser.findById(session.userId).lean()
+
+    if (!customerUser) {
+      return NextResponse.json({ message: "User not found" }, { status: 404 })
     }
 
-    if (!verifyPassword(oldPassword, customer[0].password_hash)) {
+    if (!verifyPassword(oldPassword, (customerUser as any).passwordHash)) {
       return NextResponse.json({ message: "Invalid current password" }, { status: 401 })
     }
 
     const newHash = hashPassword(newPassword)
-    await sql`
-      UPDATE customers
-      SET password_hash = ${newHash}, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ${session.customerId}
-    `
+    await CustomerUser.findByIdAndUpdate(session.userId, {
+      passwordHash: newHash,
+      updatedAt: new Date(),
+    })
 
     return NextResponse.json({ success: true, message: "Password changed successfully" })
   } catch (error) {

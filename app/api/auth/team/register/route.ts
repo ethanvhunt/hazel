@@ -1,11 +1,15 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import User from "@/models/User"
 import { hashPassword } from "@/lib/auth"
+import { logActivity } from "@/lib/activity-logger"
 import { NextResponse } from "next/server"
 import { ROLES } from "@/lib/constants"
 
 export async function POST(request: Request) {
   try {
-    const { email, password, fullName, role } = await request.json()
+    await connectDB()
+    
+    const { email, password, fullName, role, mobileNumber } = await request.json()
 
     const validRoles = [ROLES.AGENT, ROLES.MANAGER, ROLES.ADMIN, ROLES.SUPER_ADMIN]
     if (!validRoles.includes(role)) {
@@ -17,25 +21,42 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "Password must be at least 6 characters" }, { status: 400 })
     }
 
-    const existingUsers = await sql`
-      SELECT id FROM users WHERE email = ${email}
-    `
+    const existingUser = await User.findOne({ email: email.toLowerCase() })
 
-    if (existingUsers.length > 0) {
+    if (existingUser) {
       return NextResponse.json({ message: "Email already exists" }, { status: 400 })
     }
 
     const passwordHash = hashPassword(password)
 
-    const result = await sql`
-      INSERT INTO users (email, password_hash, full_name, role)
-      VALUES (${email}, ${passwordHash}, ${fullName}, ${role})
-      RETURNING id, email, role, full_name
-    `
+    const user = await User.create({
+      email: email.toLowerCase(),
+      password_hash: passwordHash,
+      full_name: fullName,
+      role,
+      mobile_number: mobileNumber || null,
+      is_active: true,
+    })
+
+    // Log the activity
+    await logActivity({
+      entityType: "user",
+      entityId: user._id,
+      action: "create",
+      performedByType: "system",
+      performedByName: "System",
+      newValues: { email: user.email, full_name: user.full_name, role: user.role },
+      details: `New team member ${user.full_name} registered`,
+    })
 
     return NextResponse.json({
       message: "Registration successful",
-      user: result[0],
+      user: {
+        id: user._id.toString(),
+        email: user.email,
+        role: user.role,
+        full_name: user.full_name,
+      },
     })
   } catch (error) {
     console.error("[v0] Registration error:", error)

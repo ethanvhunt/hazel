@@ -1,4 +1,6 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { User, CustomerAgentAssignment } from "@/models"
+import { logActivity } from "@/lib/activity-logger"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 import { ROLES } from "@/lib/constants"
@@ -21,16 +23,16 @@ export async function POST(request: Request) {
 
     const { customerId, agentId } = await request.json()
 
-    // Get the target user's role
-    const targetUser = await sql`
-      SELECT role FROM users WHERE id = ${agentId}
-    `
+    await connectToDatabase()
 
-    if (!targetUser || targetUser.length === 0) {
+    // Get the target user's role
+    const targetUser = await User.findById(agentId).lean()
+
+    if (!targetUser) {
       return NextResponse.json({ message: "Target user not found" }, { status: 404 })
     }
 
-    const targetRole = targetUser[0].role
+    const targetRole = (targetUser as any).role
 
     // Validate assignment permissions based on role
     if (session.role === ROLES.MANAGER) {
@@ -49,20 +51,46 @@ export async function POST(request: Request) {
     }
     // Super admins can assign to anyone (no restrictions)
 
-    const result = await sql`
-      INSERT INTO customer_agent_assignment (customer_id, agent_id, assigned_by, assigned_at)
-      VALUES (${customerId}, ${agentId}, ${session.userId}, CURRENT_TIMESTAMP)
-      ON CONFLICT (customer_id, agent_id) DO UPDATE SET assigned_at = CURRENT_TIMESTAMP
-      RETURNING *
-    `
+    // Check if assignment exists, update or create
+    const existingAssignment = await CustomerAgentAssignment.findOne({
+      customerId,
+      agentId,
+    })
+
+    let result
+    if (existingAssignment) {
+      result = await CustomerAgentAssignment.findByIdAndUpdate(
+        existingAssignment._id,
+        { assignedAt: new Date() },
+        { new: true }
+      ).lean()
+    } else {
+      const newAssignment = await CustomerAgentAssignment.create({
+        customerId,
+        agentId,
+        assignedBy: session.userId,
+        assignedAt: new Date(),
+      })
+      result = newAssignment.toObject()
+    }
 
     // Log activity
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, new_values)
-      VALUES ('assignment', ${customerId}, 'create', ${session.userId}, ${JSON.stringify({ agentId, customerId })})
-    `
+    await logActivity({
+      entityType: "assignment",
+      entityId: customerId,
+      action: "create",
+      performedBy: session.userId,
+      performedByType: "team",
+      newValues: { agentId, customerId },
+    })
 
-    return NextResponse.json(result[0], { status: 201 })
+    return NextResponse.json({
+      id: (result as any)._id.toString(),
+      customer_id: (result as any).customerId,
+      agent_id: (result as any).agentId,
+      assigned_by: (result as any).assignedBy,
+      assigned_at: (result as any).assignedAt,
+    }, { status: 201 })
   } catch (error) {
     console.error("[v0] Error assigning customer:", error)
     return NextResponse.json({ message: "Error assigning customer" }, { status: 500 })

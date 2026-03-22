@@ -1,4 +1,5 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { Customer, Ticket, Product } from "@/models"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 
@@ -11,18 +12,31 @@ export async function GET() {
       return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
     }
 
-    const stats = await sql`
-      SELECT 
-        (SELECT COUNT(*)::int FROM customers) as "totalCustomers",
-        (SELECT COUNT(*)::int FROM tickets WHERE status = 'open') as "openTickets",
-        (SELECT COUNT(*)::int FROM tickets WHERE status = 'in_progress') as "inProgressTickets",
-        (SELECT COUNT(*)::int FROM tickets WHERE status = 'resolved') as "resolvedTickets",
-        (SELECT COUNT(*)::int FROM products) as "totalProducts"
-    `
+    await connectToDatabase()
 
-    console.log("[v0] Stats data:", stats[0])
+    const [
+      totalCustomers,
+      openTickets,
+      inProgressTickets,
+      resolvedTickets,
+      totalProducts,
+    ] = await Promise.all([
+      Customer.countDocuments({ isActive: true }),
+      Ticket.countDocuments({ status: "open" }),
+      Ticket.countDocuments({ status: "in_progress" }),
+      Ticket.countDocuments({ status: "resolved" }),
+      Product.countDocuments({ status: "active" }),
+    ])
 
-    return NextResponse.json(stats[0])
+    const stats = {
+      totalCustomers,
+      openTickets,
+      inProgressTickets,
+      resolvedTickets,
+      totalProducts,
+    }
+
+    return NextResponse.json(stats)
   } catch (error) {
     console.error("[v0] Error fetching stats:", error)
     return NextResponse.json({ message: "Error fetching stats" }, { status: 500 })

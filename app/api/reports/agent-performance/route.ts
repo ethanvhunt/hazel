@@ -1,135 +1,197 @@
-import { neon } from '@neondatabase/serverless'
-import { cookies } from 'next/headers'
+import { connectToDatabase } from "@/lib/mongodb"
+import { User, Ticket, CustomerAgentAssignment, Message, Customer } from "@/models"
+import ExcelUpload from "@/models/ExcelUpload"
+import { cookies } from "next/headers"
 
 export async function GET() {
   try {
-    // Check authentication
+    await connectToDatabase()
+    
     const cookieStore = await cookies()
-    const sessionCookie = cookieStore.get('team-session')
+    const sessionCookie = cookieStore.get("team-session")
 
     if (!sessionCookie?.value) {
-      return Response.json({ error: 'Unauthorized' }, { status: 401 })
+      return Response.json({ error: "Unauthorized" }, { status: 401 })
     }
 
     const session = JSON.parse(decodeURIComponent(sessionCookie.value))
 
-    if (session.role !== 'super_admin') {
-      return Response.json({ error: 'Forbidden: Only super admins can access reports' }, { status: 403 })
+    if (session.role !== "super_admin") {
+      return Response.json({ error: "Forbidden: Only super admins can access reports" }, { status: 403 })
     }
 
-    const sql = neon(process.env.DATABASE_URL!)
-
-    // Get ticket counts by agent
-    const ticketCounts = await sql`
-      SELECT 
-        agent_id,
-        COUNT(*)::int as total_tickets,
-        SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END)::int as open_tickets,
-        SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END)::int as in_progress_tickets,
-        SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END)::int as resolved_tickets
-      FROM tickets
-      WHERE agent_id IS NOT NULL
-      GROUP BY agent_id
-    `
-
-    // Get client assignments by agent
-    const clientAssignments = await sql`
-      SELECT 
-        agent_id,
-        COUNT(DISTINCT customer_id)::int as total_clients
-      FROM customer_agent_assignment
-      GROUP BY agent_id
-    `
-
-    // Get excel uploads by agent
-    const excelUploads = await sql`
-      SELECT 
-        uploaded_by,
-        COUNT(*)::int as total_excel_uploads
-      FROM excel_uploads
-      WHERE uploaded_by IS NOT NULL
-      GROUP BY uploaded_by
-    `
-
-    // Get average response time per agent (time between ticket creation and first agent message)
-    const responseTime = await sql`
-      SELECT 
-        t.agent_id,
-        ROUND(AVG(EXTRACT(EPOCH FROM (m.created_at - t.created_at)) / 3600)::numeric, 2)::float as avg_response_time_hours
-      FROM tickets t
-      INNER JOIN messages m ON t.id = m.ticket_id AND m.sender_type = 'agent' AND m.sender_id = t.agent_id
-      WHERE t.agent_id IS NOT NULL
-      GROUP BY t.agent_id
-    `
-
     // Get all agents
-    const agents = await sql`
-      SELECT 
-        id,
-        full_name,
-        email,
-        gmail_address,
-        role,
-        created_at
-      FROM users
-      WHERE role IN ('agent', 'manager', 'super_admin')
-      ORDER BY created_at DESC
-    `
+    const agents = await User.find({
+      role: { $in: ["agent", "manager", "super_admin"] },
+    })
+      .sort({ createdAt: -1 })
+      .lean()
+
+    // Get ticket counts per agent
+    const ticketAggregation = await Ticket.aggregate([
+      { $match: { agentId: { $ne: null } } },
+      {
+        $group: {
+          _id: "$agentId",
+          totalTickets: { $sum: 1 },
+          openTickets: { $sum: { $cond: [{ $eq: ["$status", "open"] }, 1, 0] } },
+          inProgressTickets: { $sum: { $cond: [{ $eq: ["$status", "in_progress"] }, 1, 0] } },
+          resolvedTickets: { $sum: { $cond: [{ $eq: ["$status", "resolved"] }, 1, 0] } },
+        },
+      },
+    ])
+
+    // Get client assignments per agent
+    const clientAggregation = await CustomerAgentAssignment.aggregate([
+      {
+        $group: {
+          _id: "$agentId",
+          totalClients: { $addToSet: "$customerId" },
+        },
+      },
+      {
+        $project: {
+          _id: 1,
+          totalClients: { $size: "$totalClients" },
+        },
+      },
+    ])
+
+    // Get excel uploads per agent
+    const excelAggregation = await ExcelUpload.aggregate([
+      { $match: { uploadedBy: { $ne: null } } },
+      {
+        $group: {
+          _id: "$uploadedBy",
+          totalExcelUploads: { $sum: 1 },
+        },
+      },
+    ])
+
+    // Calculate average response time per agent
+    const responseTimeAggregation = await Ticket.aggregate([
+      { $match: { agentId: { $ne: null } } },
+      {
+        $lookup: {
+          from: "messages",
+          let: { ticketId: "$_id", agentId: "$agentId", ticketCreated: "$createdAt" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ["$ticketId", "$$ticketId"] },
+                    { $eq: ["$senderId", "$$agentId"] },
+                    { $eq: ["$senderType", "agent"] },
+                  ],
+                },
+              },
+            },
+            { $sort: { createdAt: 1 } },
+            { $limit: 1 },
+          ],
+          as: "firstAgentMessage",
+        },
+      },
+      { $unwind: { path: "$firstAgentMessage", preserveNullAndEmptyArrays: false } },
+      {
+        $group: {
+          _id: "$agentId",
+          avgResponseTimeHours: {
+            $avg: {
+              $divide: [
+                { $subtract: ["$firstAgentMessage.createdAt", "$createdAt"] },
+                1000 * 60 * 60,
+              ],
+            },
+          },
+        },
+      },
+    ])
 
     // Combine agent data with metrics
     const agentMetrics = agents.map((agent: any) => {
-      const tickets = ticketCounts.find((t: any) => t.agent_id === agent.id) || {
-        total_tickets: 0,
-        open_tickets: 0,
-        in_progress_tickets: 0,
-        resolved_tickets: 0,
+      const tickets = ticketAggregation.find((t) => t._id?.toString() === agent._id.toString()) || {
+        totalTickets: 0,
+        openTickets: 0,
+        inProgressTickets: 0,
+        resolvedTickets: 0,
       }
-      const clients = clientAssignments.find((c: any) => c.agent_id === agent.id) || { total_clients: 0 }
-      const excel = excelUploads.find((e: any) => e.uploaded_by === agent.id) || { total_excel_uploads: 0 }
-      const response = responseTime.find((r: any) => r.agent_id === agent.id) || { avg_response_time_hours: 0 }
+      const clients = clientAggregation.find((c) => c._id?.toString() === agent._id.toString()) || {
+        totalClients: 0,
+      }
+      const excel = excelAggregation.find((e) => e._id?.toString() === agent._id.toString()) || {
+        totalExcelUploads: 0,
+      }
+      const response = responseTimeAggregation.find((r) => r._id?.toString() === agent._id.toString()) || {
+        avgResponseTimeHours: 0,
+      }
 
       return {
-        ...agent,
+        id: agent._id,
+        fullName: agent.fullName,
+        email: agent.email,
+        gmailAddress: agent.gmailAddress,
+        role: agent.role,
+        createdAt: agent.createdAt,
         ...tickets,
         ...clients,
         ...excel,
-        ...response,
+        avgResponseTimeHours: Number((response.avgResponseTimeHours || 0).toFixed(2)),
       }
     })
 
     // Get detailed agent-client information
-    const agentClientDetails = await sql`
-      SELECT 
-        u.id as agent_id,
-        u.full_name as agent_name,
-        c.id as customer_id,
-        c.company_name,
-        c.contact_person,
-        c.email as customer_email,
-        COUNT(DISTINCT t.id)::int as tickets_count,
-        SUM(CASE WHEN t.status = 'resolved' THEN 1 ELSE 0 END)::int as resolved_count,
-        SUM(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END)::int as in_progress_count,
-        SUM(CASE WHEN t.status = 'open' THEN 1 ELSE 0 END)::int as open_count,
-        (SELECT COUNT(*)::int FROM excel_uploads WHERE uploaded_by = u.id AND customer_id = c.id) as excel_files_count,
-        MAX(m.created_at) as last_message_time
-      FROM users u
-      INNER JOIN customer_agent_assignment ca ON u.id = ca.agent_id
-      INNER JOIN customers c ON ca.customer_id = c.id
-      LEFT JOIN tickets t ON c.id = t.customer_id AND u.id = t.agent_id
-      LEFT JOIN messages m ON t.id = m.ticket_id
-      WHERE u.role IN ('agent', 'manager', 'super_admin')
-      GROUP BY u.id, u.full_name, c.id, c.company_name, c.contact_person, c.email
-      ORDER BY u.full_name, c.company_name
-    `
+    const assignments = await CustomerAgentAssignment.find()
+      .populate("agentId", "fullName")
+      .populate("customerId", "companyName contactPerson email")
+      .lean()
+
+    const agentClientDetails = await Promise.all(
+      assignments.map(async (assignment: any) => {
+        const tickets = await Ticket.find({
+          customerId: assignment.customerId._id,
+          agentId: assignment.agentId._id,
+        }).lean()
+
+        const excelCount = await ExcelUpload.countDocuments({
+          uploadedBy: assignment.agentId._id,
+          customerId: assignment.customerId._id,
+        })
+
+        const lastMessage = await Message.findOne({
+          ticketId: { $in: tickets.map((t: any) => t._id) },
+        })
+          .sort({ createdAt: -1 })
+          .lean()
+
+        return {
+          agentId: assignment.agentId._id,
+          agentName: assignment.agentId.fullName,
+          customerId: assignment.customerId._id,
+          companyName: assignment.customerId.companyName,
+          contactPerson: assignment.customerId.contactPerson,
+          customerEmail: assignment.customerId.email,
+          ticketsCount: tickets.length,
+          resolvedCount: tickets.filter((t: any) => t.status === "resolved").length,
+          inProgressCount: tickets.filter((t: any) => t.status === "in_progress").length,
+          openCount: tickets.filter((t: any) => t.status === "open").length,
+          excelFilesCount: excelCount,
+          lastMessageTime: lastMessage?.createdAt || null,
+        }
+      })
+    )
 
     // Calculate summary statistics
-    const totalTickets = agentMetrics.reduce((sum: number, agent: any) => sum + (agent.total_tickets || 0), 0)
-    const totalResolvedTickets = agentMetrics.reduce((sum: number, agent: any) => sum + (agent.resolved_tickets || 0), 0)
-    const totalOpenTickets = agentMetrics.reduce((sum: number, agent: any) => sum + (agent.open_tickets || 0), 0)
-    const totalInProgressTickets = agentMetrics.reduce((sum: number, agent: any) => sum + (agent.in_progress_tickets || 0), 0)
+    const totalTickets = agentMetrics.reduce((sum, agent) => sum + (agent.totalTickets || 0), 0)
+    const totalResolvedTickets = agentMetrics.reduce((sum, agent) => sum + (agent.resolvedTickets || 0), 0)
+    const totalOpenTickets = agentMetrics.reduce((sum, agent) => sum + (agent.openTickets || 0), 0)
+    const totalInProgressTickets = agentMetrics.reduce((sum, agent) => sum + (agent.inProgressTickets || 0), 0)
     const avgResponseTimeAcrossAgents =
-      agentMetrics.reduce((sum: number, agent: any) => sum + (agent.avg_response_time_hours || 0), 0) /
+      agentMetrics.reduce((sum, agent) => sum + (agent.avgResponseTimeHours || 0), 0) /
       Math.max(agentMetrics.length, 1)
+
+    const uniqueCustomerIds = [...new Set(agentClientDetails.map((item) => item.customerId.toString()))]
 
     return Response.json({
       agentMetrics,
@@ -140,19 +202,14 @@ export async function GET() {
         totalResolvedTickets,
         totalOpenTickets,
         totalInProgressTickets,
-        totalClients: agentClientDetails.reduce((acc: any, item: any) => {
-          if (!acc.includes(item.customer_id)) {
-            acc.push(item.customer_id)
-          }
-          return acc
-        }, []).length,
+        totalClients: uniqueCustomerIds.length,
         avgResponseTimeHours: Number(avgResponseTimeAcrossAgents.toFixed(2)),
       },
     })
   } catch (error) {
-    console.error('[v0] Error fetching agent performance metrics:', error)
+    console.error("Error fetching agent performance metrics:", error)
     return Response.json(
-      { error: 'Failed to fetch agent performance metrics', details: String(error) },
+      { error: "Failed to fetch agent performance metrics", details: String(error) },
       { status: 500 }
     )
   }

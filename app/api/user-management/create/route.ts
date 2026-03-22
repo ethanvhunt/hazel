@@ -1,5 +1,8 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import User from "@/models/User"
 import { hashPassword } from "@/lib/auth"
+import { logActivity } from "@/lib/activity-logger"
+import { sendSMS, formatNewUserSMS } from "@/lib/sms"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 import { ROLES } from "@/lib/constants"
@@ -25,12 +28,14 @@ async function checkAdminAuth() {
 
 export async function POST(request: Request) {
   try {
+    await connectDB()
+    
     const session = await checkAdminAuth()
     if (!session) {
       return NextResponse.json({ message: "Unauthorized" }, { status: 403 })
     }
 
-    const { email, password, fullName, role, mobile } = await request.json()
+    const { email, password, fullName, role, mobileNumber } = await request.json()
 
     const roleHierarchy: Record<string, number> = {
       super_admin: 4,
@@ -61,35 +66,60 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "Password must be at least 6 characters" }, { status: 400 })
     }
 
-    const existingUsers = await sql`
-      SELECT id FROM users WHERE email = ${email}
-    `
+    // Check for existing user
+    const existingUser = await User.findOne({ email: email.toLowerCase() })
 
-    if (existingUsers.length > 0) {
+    if (existingUser) {
       return NextResponse.json({ message: "Email already exists" }, { status: 400 })
     }
 
     const passwordHash = hashPassword(password)
 
-    const result = await sql`
-      INSERT INTO users (email, password_hash, full_name, role, mobile)
-      VALUES (${email}, ${passwordHash}, ${fullName}, ${role}, ${mobile || null})
-      RETURNING id, email, full_name, role, mobile
-    `
+    const user = await User.create({
+      email: email.toLowerCase(),
+      password_hash: passwordHash,
+      full_name: fullName,
+      role,
+      mobile_number: mobileNumber || null,
+      is_active: true,
+    })
 
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, old_values, new_values)
-      VALUES ('user', ${result[0].id}, 'create', ${session.userId}, '{}', ${JSON.stringify({
+    // Send SMS notification if mobile number provided
+    if (mobileNumber) {
+      await sendSMS({
+        to: mobileNumber,
+        message: formatNewUserSMS(fullName, password),
+        type: "user_created",
+        relatedId: user._id.toString(),
+      })
+    }
+
+    // Log activity
+    await logActivity({
+      entityType: "user",
+      entityId: user._id,
+      action: "create",
+      performedBy: session.userId,
+      performedByType: "user",
+      performedByName: session.fullName,
+      newValues: {
         email,
-        fullName,
+        full_name: fullName,
         role,
-        mobile: mobile || null,
-      })})
-    `
+        mobile_number: mobileNumber || null,
+      },
+      details: `Created team member ${fullName} with role ${role}`,
+    })
 
     return NextResponse.json({
       message: "User created successfully",
-      user: result[0],
+      user: {
+        id: user._id.toString(),
+        email: user.email,
+        full_name: user.full_name,
+        role: user.role,
+        mobile_number: user.mobile_number,
+      },
     })
   } catch (error) {
     console.error("[v0] Error creating user:", error)

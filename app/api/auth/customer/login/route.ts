@@ -1,10 +1,15 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import Customer from "@/models/Customer"
+import CustomerUser from "@/models/CustomerUser"
 import { verifyPassword } from "@/lib/auth"
+import { logActivity } from "@/lib/activity-logger"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 
 export async function POST(request: Request) {
   try {
+    await connectDB()
+    
     const body = await request.json()
     const { email, password } = body
 
@@ -13,17 +18,10 @@ export async function POST(request: Request) {
     }
 
     // First check customer_users table (customer_admin and customer_agent)
-    const customerUsers = await sql`
-      SELECT cu.id, cu.email, cu.password_hash, cu.full_name, cu.mobile_number, cu.role, cu.is_active, cu.customer_id,
-             c.company_name
-      FROM customer_users cu
-      JOIN customers c ON cu.customer_id = c.id
-      WHERE cu.email = ${email}
-    `
+    const customerUser = await CustomerUser.findOne({ email: email.toLowerCase() })
+      .populate("customer_id", "company_name")
 
-    if (customerUsers.length > 0) {
-      const customerUser = customerUsers[0]
-
+    if (customerUser) {
       if (!customerUser.is_active) {
         return NextResponse.json({ message: "Account is deactivated. Contact your admin." }, { status: 401 })
       }
@@ -32,17 +30,19 @@ export async function POST(request: Request) {
         return NextResponse.json({ message: "Invalid credentials" }, { status: 401 })
       }
 
+      const customer = customerUser.customer_id as any
+
       const cookieStore = await cookies()
       cookieStore.set(
         "customer-session",
         JSON.stringify({
-          userId: customerUser.id,
-          customerId: customerUser.customer_id,
+          userId: customerUser._id.toString(),
+          customerId: customer._id.toString(),
           email: customerUser.email,
           fullName: customerUser.full_name,
-          companyName: customerUser.company_name,
+          companyName: customer.company_name,
           mobileNumber: customerUser.mobile_number,
-          role: customerUser.role, // customer_admin or customer_agent
+          role: customerUser.role,
           userType: "customer_user",
         }),
         {
@@ -54,11 +54,22 @@ export async function POST(request: Request) {
         },
       )
 
+      // Log the login activity
+      await logActivity({
+        entityType: "customer_user",
+        entityId: customerUser._id,
+        action: "login",
+        performedBy: customerUser._id,
+        performedByType: "customer_user",
+        performedByName: customerUser.full_name,
+        details: `Customer user ${customerUser.full_name} logged in`,
+      })
+
       return NextResponse.json({
         success: true,
         message: "Login successful",
         customer: { 
-          id: customerUser.customer_id, 
+          id: customer._id.toString(), 
           email: customerUser.email,
           role: customerUser.role,
         },
@@ -66,17 +77,15 @@ export async function POST(request: Request) {
     }
 
     // Fall back to checking the main customers table (legacy login)
-    const customers = await sql`
-      SELECT id, email, password_hash, company_name, contact_person
-      FROM customers
-      WHERE email = ${email}
-    `
+    const customer = await Customer.findOne({ email: email.toLowerCase() })
 
-    if (customers.length === 0) {
+    if (!customer) {
       return NextResponse.json({ message: "Invalid credentials" }, { status: 401 })
     }
 
-    const customer = customers[0]
+    if (!customer.is_active) {
+      return NextResponse.json({ message: "Account is deactivated. Contact your admin." }, { status: 401 })
+    }
 
     if (!verifyPassword(password, customer.password_hash)) {
       return NextResponse.json({ message: "Invalid credentials" }, { status: 401 })
@@ -86,11 +95,11 @@ export async function POST(request: Request) {
     cookieStore.set(
       "customer-session",
       JSON.stringify({
-        customerId: customer.id,
+        customerId: customer._id.toString(),
         email: customer.email,
         companyName: customer.company_name,
         contactPerson: customer.contact_person,
-        role: "customer_admin", // Main customer login gets admin access
+        role: "customer_admin",
         userType: "customer",
       }),
       {
@@ -102,10 +111,21 @@ export async function POST(request: Request) {
       },
     )
 
+    // Log the login activity
+    await logActivity({
+      entityType: "customer",
+      entityId: customer._id,
+      action: "login",
+      performedBy: customer._id,
+      performedByType: "customer",
+      performedByName: customer.company_name,
+      details: `Customer ${customer.company_name} logged in`,
+    })
+
     return NextResponse.json({
       success: true,
       message: "Login successful",
-      customer: { id: customer.id, email: customer.email, role: "customer_admin" },
+      customer: { id: customer._id.toString(), email: customer.email, role: "customer_admin" },
     })
   } catch (error) {
     console.error("[v0] Customer login error:", error)

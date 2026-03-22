@@ -1,32 +1,42 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import Ticket from "@/models/Ticket"
+import Message from "@/models/Message"
+import { logActivity } from "@/lib/activity-logger"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 import { ROLES } from "@/lib/constants"
+import mongoose from "mongoose"
 
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    await connectDB()
     const { id } = await params
 
-    const tickets = await sql`
-      SELECT 
-        t.*,
-        c.company_name as customer_name,
-        cp.name as product_name,
-        cp.product_code,
-        u.full_name as agent_name,
-        u.full_name as assigned_to_name
-      FROM tickets t
-      LEFT JOIN customers c ON t.customer_id = c.id
-      LEFT JOIN catalog_products cp ON t.product_id = cp.id
-      LEFT JOIN users u ON t.assigned_agent_id = u.id
-      WHERE t.id = ${id}::uuid
-    `
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ message: "Invalid ticket ID" }, { status: 400 })
+    }
 
-    if (tickets.length === 0) {
+    const ticket = await Ticket.findById(id)
+      .populate("customer_id", "company_name email")
+      .populate("product_id", "name product_code")
+      .populate("assigned_agent_id", "full_name email")
+      .lean()
+
+    if (!ticket) {
       return NextResponse.json({ message: "Ticket not found" }, { status: 404 })
     }
 
-    return NextResponse.json(tickets[0])
+    const transformed = {
+      ...ticket,
+      id: (ticket as any)._id.toString(),
+      customer_name: (ticket as any).customer_id?.company_name || null,
+      product_name: (ticket as any).product_id?.name || null,
+      product_code: (ticket as any).product_id?.product_code || null,
+      agent_name: (ticket as any).assigned_agent_id?.full_name || null,
+      assigned_to_name: (ticket as any).assigned_agent_id?.full_name || null,
+    }
+
+    return NextResponse.json(transformed)
   } catch (error) {
     console.error("[v0] Error fetching ticket:", error)
     return NextResponse.json({ message: "Error fetching ticket", error: String(error) }, { status: 500 })
@@ -35,200 +45,111 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
 
 export async function PUT(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    await connectDB()
     const { id } = await params
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")
+    const customerSession = cookieStore.get("customer-session")
 
-    if (!teamSession) {
-      console.error("[v0] No team session found")
-      return NextResponse.json({ message: "Unauthorized - No session" }, { status: 401 })
+    if (!teamSession && !customerSession) {
+      return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
     }
 
     let session
+    let userType = "team"
     try {
-      session = JSON.parse(teamSession.value)
-    } catch (error) {
-      console.error("[v0] Failed to parse session:", error)
+      if (teamSession) {
+        session = JSON.parse(teamSession.value)
+        userType = "team"
+      } else if (customerSession) {
+        session = JSON.parse(customerSession.value)
+        userType = "customer"
+      }
+    } catch {
       return NextResponse.json({ message: "Unauthorized - Invalid session" }, { status: 401 })
     }
 
-    if (!session.userId) {
-      console.error("[v0] Session missing userId:", session)
-      return NextResponse.json({ message: "Unauthorized - Invalid session data" }, { status: 401 })
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ message: "Invalid ticket ID" }, { status: 400 })
     }
 
     const body = await request.json()
     const { status, agentId, priority } = body
 
-    console.log("[v0] Update request:", { id, status, agentId, priority, userId: session.userId })
+    const currentTicket = await Ticket.findById(id).lean()
 
-    const currentTickets = await sql`SELECT * FROM tickets WHERE id = ${id}::uuid`
-
-    if (currentTickets.length === 0) {
-      console.error("[v0] Ticket not found:", id)
+    if (!currentTicket) {
       return NextResponse.json({ message: "Ticket not found" }, { status: 404 })
     }
 
-    const currentTicket = currentTickets[0]
-    console.log("[v0] Current ticket:", currentTicket)
-
-    let updatedTicket
-
-    if (status !== undefined && agentId !== undefined && priority !== undefined) {
-      // Update all three fields
-      const result = await sql`
-        UPDATE tickets 
-        SET 
-          status = ${status}::varchar,
-          agent_id = ${agentId}::uuid,
-          priority = ${priority}::varchar,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE id = ${id}::uuid
-        RETURNING *
-      `
-      updatedTicket = result[0]
-    } else if (status !== undefined && agentId !== undefined) {
-      // Update status and agent
-      const result = await sql`
-        UPDATE tickets 
-        SET 
-          status = ${status}::varchar,
-          agent_id = ${agentId}::uuid,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE id = ${id}::uuid
-        RETURNING *
-      `
-      updatedTicket = result[0]
-    } else if (status !== undefined && priority !== undefined) {
-      // Update status and priority
-      const result = await sql`
-        UPDATE tickets 
-        SET 
-          status = ${status}::varchar,
-          priority = ${priority}::varchar,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE id = ${id}::uuid
-        RETURNING *
-      `
-      updatedTicket = result[0]
-    } else if (agentId !== undefined && priority !== undefined) {
-      // Update agent and priority
-      const result = await sql`
-        UPDATE tickets 
-        SET 
-          agent_id = ${agentId}::uuid,
-          priority = ${priority}::varchar,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE id = ${id}::uuid
-        RETURNING *
-      `
-      updatedTicket = result[0]
-    } else if (status !== undefined) {
-      // Update only status
-      const result = await sql`
-        UPDATE tickets 
-        SET 
-          status = ${status}::varchar,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE id = ${id}::uuid
-        RETURNING *
-      `
-      updatedTicket = result[0]
-    } else if (agentId !== undefined) {
-      // Update only agent
-      const result = await sql`
-        UPDATE tickets 
-        SET 
-          agent_id = ${agentId}::uuid,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE id = ${id}::uuid
-        RETURNING *
-      `
-      updatedTicket = result[0]
-    } else if (priority !== undefined) {
-      // Update only priority
-      const result = await sql`
-        UPDATE tickets 
-        SET 
-          priority = ${priority}::varchar,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE id = ${id}::uuid
-        RETURNING *
-      `
-      updatedTicket = result[0]
-    } else {
-      console.error("[v0] No update fields provided")
-      return NextResponse.json({ message: "No updates provided" }, { status: 400 })
-    }
-
-    console.log("[v0] Ticket updated successfully:", updatedTicket)
-
+    // Build update object
+    const updateData: any = {}
     const oldValues: any = {}
     const newValues: any = {}
 
     if (status !== undefined) {
-      oldValues.status = currentTicket.status
+      oldValues.status = (currentTicket as any).status
       newValues.status = status
+      updateData.status = status
+
+      // Reset auto-close time when status changes
+      if (status === "in_progress" || status === "open") {
+        updateData.auto_close_at = new Date(Date.now() + 2 * 60 * 60 * 1000)
+      } else {
+        updateData.auto_close_at = null
+      }
     }
     if (agentId !== undefined) {
-      oldValues.agent_id = currentTicket.agent_id
-      newValues.agent_id = agentId
+      oldValues.assigned_agent_id = (currentTicket as any).assigned_agent_id
+      newValues.assigned_agent_id = agentId
+      updateData.assigned_agent_id = agentId || null
     }
     if (priority !== undefined) {
-      oldValues.priority = currentTicket.priority
+      oldValues.priority = (currentTicket as any).priority
       newValues.priority = priority
+      updateData.priority = priority
     }
 
-    try {
-      await sql`
-        INSERT INTO activity_logs (
-          entity_type, 
-          entity_id, 
-          action, 
-          performed_by, 
-          old_values, 
-          new_values
-        )
-        VALUES (
-          'ticket'::varchar,
-          ${id}::uuid,
-          'update'::varchar,
-          ${session.userId}::uuid,
-          ${JSON.stringify(oldValues)}::jsonb,
-          ${JSON.stringify(newValues)}::jsonb
-        )
-      `
-      console.log("[v0] Activity logged successfully")
-    } catch (logError) {
-      console.error("[v0] Failed to log activity (non-critical):", logError)
-      // Don't fail the request if logging fails
+    if (Object.keys(updateData).length === 0) {
+      return NextResponse.json({ message: "No updates provided" }, { status: 400 })
     }
 
-    const finalTickets = await sql`
-      SELECT 
-        t.*,
-        c.company_name as customer_name,
-        cp.name as product_name,
-        cp.product_code,
-        u.full_name as agent_name,
-        u.full_name as assigned_to_name
-      FROM tickets t
-      LEFT JOIN customers c ON t.customer_id = c.id
-      LEFT JOIN catalog_products cp ON t.product_id = cp.id
-      LEFT JOIN users u ON t.assigned_agent_id = u.id
-      WHERE t.id = ${id}::uuid
-    `
+    const updatedTicket = await Ticket.findByIdAndUpdate(
+      id,
+      { $set: updateData },
+      { new: true }
+    )
+      .populate("customer_id", "company_name email")
+      .populate("product_id", "name product_code")
+      .populate("assigned_agent_id", "full_name email")
 
-    return NextResponse.json(finalTickets[0])
+    // Log activity
+    await logActivity({
+      entityType: "ticket",
+      entityId: id,
+      action: "update",
+      performedBy: session.userId,
+      performedByType: userType === "team" ? "user" : "customer_user",
+      performedByName: session.fullName || session.companyName,
+      oldValues,
+      newValues,
+      details: `Updated ticket ${(currentTicket as any).ticket_number}`,
+    })
+
+    const transformed = {
+      ...updatedTicket?.toObject(),
+      id: updatedTicket?._id.toString(),
+      customer_name: (updatedTicket as any)?.customer_id?.company_name || null,
+      product_name: (updatedTicket as any)?.product_id?.name || null,
+      product_code: (updatedTicket as any)?.product_id?.product_code || null,
+      agent_name: (updatedTicket as any)?.assigned_agent_id?.full_name || null,
+      assigned_to_name: (updatedTicket as any)?.assigned_agent_id?.full_name || null,
+    }
+
+    return NextResponse.json(transformed)
   } catch (error) {
     console.error("[v0] Error updating ticket:", error)
-    return NextResponse.json(
-      {
-        message: "Error updating ticket",
-        error: String(error),
-      },
-      { status: 500 },
-    )
+    return NextResponse.json({ message: "Error updating ticket", error: String(error) }, { status: 500 })
   }
 }
 
@@ -238,6 +159,7 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
 
 export async function DELETE(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    await connectDB()
     const { id } = await params
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")
@@ -258,30 +180,37 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       return NextResponse.json({ message: "Unauthorized. Only super admin can delete tickets." }, { status: 403 })
     }
 
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ message: "Invalid ticket ID" }, { status: 400 })
+    }
+
     // Get ticket data for logging
-    const tickets = await sql`SELECT * FROM tickets WHERE id = ${id}::uuid`
-    if (tickets.length === 0) {
+    const ticket = await Ticket.findById(id).lean()
+    if (!ticket) {
       return NextResponse.json({ message: "Ticket not found" }, { status: 404 })
     }
 
-    const ticketToDelete = tickets[0]
-
     // Delete related messages first
-    await sql`DELETE FROM messages WHERE ticket_id = ${id}::uuid`
+    await Message.deleteMany({ ticket_id: id })
 
     // Delete the ticket
-    await sql`DELETE FROM tickets WHERE id = ${id}::uuid`
+    await Ticket.findByIdAndDelete(id)
 
     // Log activity
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, old_values, new_values)
-      VALUES ('ticket', ${id}::uuid, 'delete', ${session.userId}::uuid, ${JSON.stringify({
-        id: ticketToDelete.id,
-        title: ticketToDelete.title,
-        status: ticketToDelete.status,
-        priority: ticketToDelete.priority,
-      })}::jsonb, null)
-    `
+    await logActivity({
+      entityType: "ticket",
+      entityId: id,
+      action: "delete",
+      performedBy: session.userId,
+      performedByType: "user",
+      performedByName: session.fullName,
+      oldValues: {
+        ticket_number: (ticket as any).ticket_number,
+        title: (ticket as any).title,
+        status: (ticket as any).status,
+      },
+      details: `Deleted ticket ${(ticket as any).ticket_number}`,
+    })
 
     return NextResponse.json({ message: "Ticket deleted successfully" })
   } catch (error) {

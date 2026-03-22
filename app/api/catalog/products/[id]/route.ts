@@ -1,11 +1,17 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import Product from "@/models/Product"
+import CustomerProduct from "@/models/CustomerProduct"
+import { logActivity } from "@/lib/activity-logger"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 import { ROLES } from "@/lib/constants"
+import mongoose from "mongoose"
 
 // GET single product
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    await connectDB()
+    
     const { id } = await params
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")?.value
@@ -15,46 +21,59 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
       return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
     }
 
-    const product = await sql`
-      SELECT cp.*, pc.name as category_name, pc.slug as category_slug
-      FROM catalog_products cp
-      LEFT JOIN product_categories pc ON cp.category_id = pc.id
-      WHERE cp.id = ${id}
-    `
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ message: "Invalid product ID" }, { status: 400 })
+    }
 
-    if (product.length === 0) {
+    const product = await Product.findById(id)
+      .populate("category_id", "name slug")
+      .lean()
+
+    if (!product) {
       return NextResponse.json({ message: "Product not found" }, { status: 404 })
+    }
+
+    const transformedProduct = {
+      ...product,
+      id: (product as any)._id.toString(),
+      category_name: (product as any).category_id?.name || null,
+      category_slug: (product as any).category_id?.slug || null,
     }
 
     // For customer session, verify they have access to this product
     if (customerSession) {
       const session = JSON.parse(customerSession)
-      const assignment = await sql`
-        SELECT * FROM customer_product_assignments
-        WHERE product_id = ${id} AND customer_id = ${session.customerId}
-      `
-      if (assignment.length === 0) {
+      const assignment = await CustomerProduct.findOne({
+        product_id: id,
+        customer_id: session.customerId,
+      }).lean()
+
+      if (!assignment) {
         return NextResponse.json({ message: "Product not found" }, { status: 404 })
       }
 
-      // Include assignment info for customer view
       return NextResponse.json({
-        ...product[0],
-        assigned_at: assignment[0].assigned_at,
-        assignment_notes: assignment[0].notes
+        ...transformedProduct,
+        assigned_at: (assignment as any).assigned_at,
+        assignment_notes: (assignment as any).notes,
       })
     }
 
     // For team session, also get assigned customers
-    const assignments = await sql`
-      SELECT cpa.*, c.company_name, c.contact_email
-      FROM customer_product_assignments cpa
-      JOIN customers c ON cpa.customer_id = c.id
-      WHERE cpa.product_id = ${id}
-      ORDER BY cpa.assigned_at DESC
-    `
+    const assignments = await CustomerProduct.find({ product_id: id })
+      .populate("customer_id", "company_name email")
+      .sort({ assigned_at: -1 })
+      .lean()
 
-    return NextResponse.json({ product: product[0], assignments })
+    const transformedAssignments = assignments.map((a: any) => ({
+      id: a._id.toString(),
+      customer_id: a.customer_id?._id?.toString(),
+      company_name: a.customer_id?.company_name,
+      assigned_at: a.assigned_at,
+      notes: a.notes,
+    }))
+
+    return NextResponse.json({ product: transformedProduct, assignments: transformedAssignments })
   } catch (error) {
     console.error("[v0] Get product error:", error)
     return NextResponse.json({ message: "Internal server error" }, { status: 500 })
@@ -64,6 +83,8 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
 // PUT - Update product
 export async function PUT(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    await connectDB()
+    
     const { id } = await params
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")?.value
@@ -78,36 +99,56 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       return NextResponse.json({ message: "Unauthorized" }, { status: 403 })
     }
 
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ message: "Invalid product ID" }, { status: 400 })
+    }
+
     const body = await request.json()
     const { name, description, category_id, brand, model, serial_number, specifications, status } = body
 
-    const result = await sql`
-      UPDATE catalog_products
-      SET 
-        name = COALESCE(${name}, name),
-        description = COALESCE(${description}, description),
-        category_id = COALESCE(${category_id}, category_id),
-        brand = COALESCE(${brand}, brand),
-        model = COALESCE(${model}, model),
-        serial_number = COALESCE(${serial_number}, serial_number),
-        specifications = COALESCE(${specifications ? JSON.stringify(specifications) : null}::jsonb, specifications),
-        status = COALESCE(${status}, status),
-        updated_at = NOW()
-      WHERE id = ${id}
-      RETURNING *
-    `
-
-    if (result.length === 0) {
+    // Get old values for logging
+    const oldProduct = await Product.findById(id).lean()
+    if (!oldProduct) {
       return NextResponse.json({ message: "Product not found" }, { status: 404 })
     }
 
-    // Log activity
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, new_values)
-      VALUES ('product', ${id}::uuid, 'update', ${sessionData.userId}::uuid, ${JSON.stringify({ name, status })}::jsonb)
-    `
+    const updateData: any = {}
+    if (name !== undefined) updateData.name = name
+    if (description !== undefined) updateData.description = description
+    if (category_id !== undefined) updateData.category_id = category_id
+    if (brand !== undefined) updateData.brand = brand
+    if (model !== undefined) updateData.model = model
+    if (serial_number !== undefined) updateData.serial_number = serial_number
+    if (specifications !== undefined) updateData.specifications = specifications
+    if (status !== undefined) updateData.status = status
 
-    return NextResponse.json({ product: result[0] })
+    const product = await Product.findByIdAndUpdate(
+      id,
+      { $set: updateData },
+      { new: true }
+    ).populate("category_id", "name slug")
+
+    // Log activity
+    await logActivity({
+      entityType: "product",
+      entityId: id,
+      action: "update",
+      performedBy: sessionData.userId,
+      performedByType: "user",
+      performedByName: sessionData.fullName,
+      oldValues: { name: (oldProduct as any).name, status: (oldProduct as any).status },
+      newValues: { name: product?.name, status: product?.status },
+      details: `Updated product ${product?.product_code}`,
+    })
+
+    return NextResponse.json({
+      product: {
+        ...product?.toObject(),
+        id: product?._id.toString(),
+        category_name: (product as any)?.category_id?.name || null,
+        category_slug: (product as any)?.category_id?.slug || null,
+      },
+    })
   } catch (error) {
     console.error("[v0] Update product error:", error)
     return NextResponse.json({ message: "Internal server error" }, { status: 500 })
@@ -117,6 +158,8 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
 // DELETE - Only super_admin can delete
 export async function DELETE(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    await connectDB()
+    
     const { id } = await params
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")?.value
@@ -132,27 +175,34 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       return NextResponse.json({ message: "Only super admin can delete products" }, { status: 403 })
     }
 
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ message: "Invalid product ID" }, { status: 400 })
+    }
+
     // Get product info for logging
-    const product = await sql`SELECT * FROM catalog_products WHERE id = ${id}`
+    const product = await Product.findById(id).lean()
     
-    if (product.length === 0) {
+    if (!product) {
       return NextResponse.json({ message: "Product not found" }, { status: 404 })
     }
 
     // Delete assignments first
-    await sql`DELETE FROM customer_product_assignments WHERE product_id = ${id}`
+    await CustomerProduct.deleteMany({ product_id: id })
     
     // Delete product
-    await sql`DELETE FROM catalog_products WHERE id = ${id}`
+    await Product.findByIdAndDelete(id)
 
     // Log activity
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, old_values)
-      VALUES ('product', ${id}::uuid, 'delete', ${sessionData.userId}::uuid, ${JSON.stringify({ 
-        product_code: product[0].product_code, 
-        name: product[0].name 
-      })}::jsonb)
-    `
+    await logActivity({
+      entityType: "product",
+      entityId: id,
+      action: "delete",
+      performedBy: sessionData.userId,
+      performedByType: "user",
+      performedByName: sessionData.fullName,
+      oldValues: { product_code: (product as any).product_code, name: (product as any).name },
+      details: `Deleted product ${(product as any).product_code} - ${(product as any).name}`,
+    })
 
     return NextResponse.json({ message: "Product deleted successfully" })
   } catch (error) {

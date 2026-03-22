@@ -1,4 +1,5 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { User } from "@/models"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 
@@ -12,17 +13,28 @@ export async function GET() {
     }
 
     const session = JSON.parse(sessionStr)
-    const user = await sql`
-      SELECT id, email, full_name, role, created_at, updated_at, gmail_address
-      FROM users
-      WHERE id = ${session.userId}
-    `
+    
+    await connectToDatabase()
+    
+    const user = await User.findById(session.userId)
+      .select("-passwordHash")
+      .lean()
 
-    if (user.length === 0) {
+    if (!user) {
       return NextResponse.json({ message: "User not found" }, { status: 404 })
     }
 
-    return NextResponse.json({ user: user[0] })
+    return NextResponse.json({
+      user: {
+        id: (user as any)._id.toString(),
+        email: (user as any).email,
+        full_name: (user as any).fullName,
+        role: (user as any).role,
+        created_at: (user as any).createdAt,
+        updated_at: (user as any).updatedAt,
+        gmail_address: (user as any).gmailAddress,
+      },
+    })
   } catch (error) {
     console.error("[v0] Get profile error:", error)
     return NextResponse.json({ message: "Internal server error" }, { status: 500 })
@@ -41,11 +53,13 @@ export async function PUT(request: Request) {
     const session = JSON.parse(sessionStr)
     const { fullName, gmailAddress } = await request.json()
 
-    await sql`
-      UPDATE users
-      SET full_name = ${fullName}, gmail_address = ${gmailAddress || null}, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ${session.userId}
-    `
+    await connectToDatabase()
+
+    await User.findByIdAndUpdate(session.userId, {
+      fullName,
+      gmailAddress: gmailAddress || null,
+      updatedAt: new Date(),
+    })
 
     return NextResponse.json({ success: true, message: "Profile updated" })
   } catch (error) {

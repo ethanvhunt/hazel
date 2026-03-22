@@ -1,4 +1,6 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { CustomerUser } from "@/models"
+import { logActivity } from "@/lib/activity-logger"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 import { hashPassword } from "@/lib/auth"
@@ -9,14 +11,14 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
   try {
     const { id: customerId } = await params
     const cookieStore = await cookies()
-    const session = cookieStore.get("session")?.value
+    const teamSession = cookieStore.get("team-session")?.value
     const customerSession = cookieStore.get("customer-session")?.value
 
     // Team members or customer_admin can view users
     let hasAccess = false
     
-    if (session) {
-      const sessionData = JSON.parse(session)
+    if (teamSession) {
+      const sessionData = JSON.parse(teamSession)
       if (["super_admin", "admin", "manager", "agent"].includes(sessionData.role)) {
         hasAccess = true
       }
@@ -33,14 +35,25 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
       return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
     }
 
-    const users = await sql`
-      SELECT id, full_name, email, mobile_number, role, is_active, created_at
-      FROM customer_users
-      WHERE customer_id = ${customerId}
-      ORDER BY created_at DESC
-    `
+    await connectToDatabase()
 
-    return NextResponse.json(users)
+    const users = await CustomerUser.find({ customerId })
+      .select("-passwordHash")
+      .sort({ createdAt: -1 })
+      .lean()
+
+    // Transform for frontend compatibility
+    const transformed = users.map((u: any) => ({
+      id: u._id.toString(),
+      full_name: u.fullName,
+      email: u.email,
+      mobile_number: u.mobileNumber,
+      role: u.role,
+      is_active: u.isActive,
+      created_at: u.createdAt,
+    }))
+
+    return NextResponse.json(transformed)
   } catch (error) {
     console.error("[v0] Get customer users error:", error)
     return NextResponse.json({ message: "Internal server error" }, { status: 500 })
@@ -52,15 +65,15 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   try {
     const { id: customerId } = await params
     const cookieStore = await cookies()
-    const session = cookieStore.get("session")?.value
+    const teamSession = cookieStore.get("team-session")?.value
     const customerSession = cookieStore.get("customer-session")?.value
 
     let createdBy: string | null = null
     let hasAccess = false
     
     // Team members can create users
-    if (session) {
-      const sessionData = JSON.parse(session)
+    if (teamSession) {
+      const sessionData = JSON.parse(teamSession)
       if (["super_admin", "admin", "manager"].includes(sessionData.role)) {
         hasAccess = true
         createdBy = sessionData.userId
@@ -99,11 +112,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       }
     }
 
+    await connectToDatabase()
+
     // Check if email already exists
-    const existing = await sql`
-      SELECT id FROM customer_users WHERE email = ${email}
-    `
-    if (existing.length > 0) {
+    const existing = await CustomerUser.findOne({ email })
+    if (existing) {
       return NextResponse.json({ message: "Email already exists" }, { status: 400 })
     }
 
@@ -111,30 +124,49 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const tempPassword = password || Math.random().toString(36).slice(-8)
     const passwordHash = hashPassword(tempPassword)
 
-    const result = await sql`
-      INSERT INTO customer_users (customer_id, full_name, email, mobile_number, password_hash, role, created_by)
-      VALUES (${customerId}, ${full_name}, ${email}, ${mobile_number}, ${passwordHash}, ${role}, ${createdBy})
-      RETURNING id, full_name, email, mobile_number, role, is_active, created_at
-    `
+    const newUser = await CustomerUser.create({
+      customerId,
+      fullName: full_name,
+      email,
+      mobileNumber: mobile_number,
+      passwordHash,
+      role,
+      createdBy,
+    })
 
     // Send SMS with credentials
     await sendSMS({
       to: mobile_number,
       message: formatNewUserSMS(full_name, tempPassword),
       type: "user_created",
-      relatedId: result[0].id,
+      relatedId: newUser._id.toString(),
     })
 
     // Log activity
-    if (session) {
-      const sessionData = JSON.parse(session)
-      await sql`
-        INSERT INTO activity_logs (user_id, action, entity_type, entity_id, details)
-        VALUES (${sessionData.userId}, 'create', 'customer_user', ${result[0].id}, ${JSON.stringify({ full_name, role, customer_id: customerId })})
-      `
+    if (teamSession) {
+      const sessionData = JSON.parse(teamSession)
+      await logActivity({
+        entityType: "customer_user",
+        entityId: newUser._id.toString(),
+        action: "create",
+        performedBy: sessionData.userId,
+        performedByType: "team",
+        newValues: { fullName: full_name, role, customerId },
+      })
     }
 
-    return NextResponse.json({ user: result[0], tempPassword }, { status: 201 })
+    return NextResponse.json({
+      user: {
+        id: newUser._id.toString(),
+        full_name: newUser.fullName,
+        email: newUser.email,
+        mobile_number: newUser.mobileNumber,
+        role: newUser.role,
+        is_active: newUser.isActive,
+        created_at: newUser.createdAt,
+      },
+      tempPassword,
+    }, { status: 201 })
   } catch (error) {
     console.error("[v0] Create customer user error:", error)
     return NextResponse.json({ message: "Internal server error" }, { status: 500 })

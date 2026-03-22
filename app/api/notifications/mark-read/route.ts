@@ -1,9 +1,12 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { Notification } from "@/models"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 
 export async function POST(request: Request) {
   try {
+    await connectToDatabase()
+    
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")
     const customerSession = cookieStore.get("customer-session")
@@ -18,15 +21,14 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "No notification IDs provided" }, { status: 400 })
     }
 
-    await sql`
-      UPDATE notifications
-      SET read = true, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ANY(${notificationIds}::uuid[])
-    `
+    await Notification.updateMany(
+      { _id: { $in: notificationIds } },
+      { $set: { read: true } }
+    )
 
     return NextResponse.json({ message: "Notifications marked as read", success: true })
   } catch (error) {
-    console.error("[v0] Error marking notifications as read:", error)
+    console.error("Error marking notifications as read:", error)
     return NextResponse.json({ message: "Error marking notifications" }, { status: 500 })
   }
 }

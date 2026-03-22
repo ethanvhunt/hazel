@@ -1,4 +1,5 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { Message, Ticket, Customer, User } from "@/models"
 import { NextResponse } from "next/server"
 import { sendMessageEmail } from "@/lib/email-service"
 
@@ -11,14 +12,23 @@ export async function GET(request: Request) {
       return NextResponse.json({ message: "Ticket ID required" }, { status: 400 })
     }
 
-    const messages = await sql`
-      SELECT id, ticket_id, sender_type, sender_id, message, created_at
-      FROM messages
-      WHERE ticket_id = ${ticketId}
-      ORDER BY created_at ASC
-    `
+    await connectToDatabase()
 
-    return NextResponse.json(messages)
+    const messages = await Message.find({ ticketId })
+      .sort({ createdAt: 1 })
+      .lean()
+
+    // Transform for frontend compatibility
+    const transformed = messages.map((m: any) => ({
+      id: m._id.toString(),
+      ticket_id: m.ticketId,
+      sender_type: m.senderType,
+      sender_id: m.senderId,
+      message: m.message,
+      created_at: m.createdAt,
+    }))
+
+    return NextResponse.json(transformed)
   } catch (error) {
     console.error("Error fetching messages:", error)
     return NextResponse.json({ message: "Error fetching messages" }, { status: 500 })
@@ -29,44 +39,53 @@ export async function POST(request: Request) {
   try {
     const { ticketId, senderType, senderId, message } = await request.json()
 
-    const result = await sql`
-      INSERT INTO messages (ticket_id, sender_type, sender_id, message)
-      VALUES (${ticketId}, ${senderType}, ${senderId}, ${message})
-      RETURNING *
-    `
+    await connectToDatabase()
+
+    const newMessage = await Message.create({
+      ticketId,
+      senderType,
+      senderId,
+      message,
+    })
+
+    // Update ticket's last activity
+    await Ticket.findByIdAndUpdate(ticketId, {
+      lastActivityAt: new Date(),
+      updatedAt: new Date(),
+    })
 
     if (senderType === "customer") {
       try {
         // Get ticket details
-        const ticket = await sql`
-          SELECT t.*, c.company_name FROM tickets t
-          LEFT JOIN customers c ON t.customer_id = c.id
-          WHERE t.id = ${ticketId}
-        `
+        const ticket = await Ticket.findById(ticketId).lean()
 
-        if (ticket.length > 0) {
-          // Get agent's email
-          const agent = await sql`
-            SELECT full_name, gmail_address FROM users WHERE id = ${ticket[0].agent_id}
-          `
+        if (ticket) {
+          const customer = await Customer.findById((ticket as any).customerId).lean()
+          const agent = await User.findById((ticket as any).agentId).lean()
 
-          if (agent.length > 0 && agent[0].gmail_address) {
+          if (agent && (agent as any).gmailAddress) {
             await sendMessageEmail(
-              agent[0].gmail_address,
-              ticket[0].company_name || "Customer",
+              (agent as any).gmailAddress,
+              (customer as any)?.companyName || "Customer",
               message,
-              ticket[0].title,
+              (ticket as any).title,
               ticketId,
             )
           }
         }
       } catch (emailError) {
         console.error("[v0] Failed to send message email:", emailError)
-        // Don't fail the message creation if email fails
       }
     }
 
-    return NextResponse.json(result[0], { status: 201 })
+    return NextResponse.json({
+      id: newMessage._id.toString(),
+      ticket_id: newMessage.ticketId,
+      sender_type: newMessage.senderType,
+      sender_id: newMessage.senderId,
+      message: newMessage.message,
+      created_at: newMessage.createdAt,
+    }, { status: 201 })
   } catch (error) {
     console.error("Error creating message:", error)
     return NextResponse.json({ message: "Error creating message" }, { status: 500 })

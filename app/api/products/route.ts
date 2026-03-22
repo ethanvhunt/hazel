@@ -1,4 +1,5 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { Product, CustomerProduct, ProductCategory } from "@/models"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 
@@ -12,174 +13,133 @@ export async function GET(request: Request) {
     const customerId = searchParams.get("customerId")
     const search = searchParams.get("search")
 
+    await connectToDatabase()
+
     // Customer portal - fetch assigned products via customer_product_assignments
     if (customerSession) {
       const session = JSON.parse(customerSession)
       const cid = customerId || session.customerId
 
-      let query = sql`
-        SELECT 
-          cp.id,
-          cp.product_code,
-          cp.name,
-          cp.description,
-          cp.category_id,
-          cp.brand,
-          cp.model,
-          cp.serial_number,
-          cp.specifications,
-          cp.status,
-          cp.created_at,
-          cp.updated_at,
-          pc.name as category_name,
-          cpa.assigned_at,
-          cpa.notes as assignment_notes
-        FROM catalog_products cp
-        JOIN customer_product_assignments cpa ON cp.id = cpa.product_id
-        LEFT JOIN product_categories pc ON cp.category_id = pc.id
-        WHERE cpa.customer_id = ${cid}
-      `
+      // Get all product assignments for this customer
+      const assignments = await CustomerProduct.find({ customerId: cid, isActive: true }).lean()
+      const productIds = assignments.map((a: any) => a.productId)
 
+      let query: any = { _id: { $in: productIds } }
+      
       if (search) {
-        query = sql`
-          SELECT 
-            cp.id,
-            cp.product_code,
-            cp.name,
-            cp.description,
-            cp.category_id,
-            cp.brand,
-            cp.model,
-            cp.serial_number,
-            cp.specifications,
-            cp.status,
-            cp.created_at,
-            cp.updated_at,
-            pc.name as category_name,
-            cpa.assigned_at,
-            cpa.notes as assignment_notes
-          FROM catalog_products cp
-          JOIN customer_product_assignments cpa ON cp.id = cpa.product_id
-          LEFT JOIN product_categories pc ON cp.category_id = pc.id
-          WHERE cpa.customer_id = ${cid}
-            AND (LOWER(cp.name) LIKE ${`%${search.toLowerCase()}%`} 
-                 OR LOWER(cp.product_code) LIKE ${`%${search.toLowerCase()}%`}
-                 OR LOWER(cp.brand) LIKE ${`%${search.toLowerCase()}%`}
-                 OR LOWER(cp.model) LIKE ${`%${search.toLowerCase()}%`})
-          ORDER BY cp.name ASC
-        `
-      } else {
-        query = sql`
-          SELECT 
-            cp.id,
-            cp.product_code,
-            cp.name,
-            cp.description,
-            cp.category_id,
-            cp.brand,
-            cp.model,
-            cp.serial_number,
-            cp.specifications,
-            cp.status,
-            cp.created_at,
-            cp.updated_at,
-            pc.name as category_name,
-            cpa.assigned_at,
-            cpa.notes as assignment_notes
-          FROM catalog_products cp
-          JOIN customer_product_assignments cpa ON cp.id = cpa.product_id
-          LEFT JOIN product_categories pc ON cp.category_id = pc.id
-          WHERE cpa.customer_id = ${cid}
-          ORDER BY cp.name ASC
-        `
+        query.$or = [
+          { name: { $regex: search, $options: "i" } },
+          { productCode: { $regex: search, $options: "i" } },
+          { brand: { $regex: search, $options: "i" } },
+          { model: { $regex: search, $options: "i" } },
+        ]
       }
 
-      const products = await query
-      return NextResponse.json(products)
+      const products = await Product.find(query).sort({ name: 1 }).lean()
+
+      // Get category info and merge with assignment data
+      const categoryIds = products.map((p: any) => p.categoryId).filter(Boolean)
+      const categories = await ProductCategory.find({ _id: { $in: categoryIds } }).lean()
+      const categoryMap = new Map(categories.map((c: any) => [c._id.toString(), c]))
+
+      const assignmentMap = new Map(assignments.map((a: any) => [a.productId.toString(), a]))
+
+      const transformed = products.map((p: any) => {
+        const category = categoryMap.get(p.categoryId?.toString())
+        const assignment = assignmentMap.get(p._id.toString())
+        return {
+          id: p._id.toString(),
+          product_code: p.productCode,
+          name: p.name,
+          description: p.description,
+          category_id: p.categoryId,
+          brand: p.brand,
+          model: p.model,
+          serial_number: p.serialNumber,
+          specifications: p.specifications,
+          status: p.status,
+          created_at: p.createdAt,
+          updated_at: p.updatedAt,
+          category_name: (category as any)?.name,
+          assigned_at: (assignment as any)?.assignedAt,
+          assignment_notes: (assignment as any)?.notes,
+        }
+      })
+
+      return NextResponse.json(transformed)
     }
 
     // Team portal - fetch all products or by customer
     if (teamSession) {
       if (customerId) {
         // Get assigned products for a specific customer
-        const products = await sql`
-          SELECT 
-            cp.id,
-            cp.product_code,
-            cp.name,
-            cp.description,
-            cp.category_id,
-            cp.brand,
-            cp.model,
-            cp.serial_number,
-            cp.specifications,
-            cp.status,
-            cp.created_at,
-            cp.updated_at,
-            pc.name as category_name,
-            cpa.assigned_at,
-            cpa.notes as assignment_notes
-          FROM catalog_products cp
-          JOIN customer_product_assignments cpa ON cp.id = cpa.product_id
-          LEFT JOIN product_categories pc ON cp.category_id = pc.id
-          WHERE cpa.customer_id = ${customerId}
-          ORDER BY cp.name ASC
-        `
-        return NextResponse.json(products)
+        const assignments = await CustomerProduct.find({ customerId, isActive: true }).lean()
+        const productIds = assignments.map((a: any) => a.productId)
+        
+        const products = await Product.find({ _id: { $in: productIds } }).sort({ name: 1 }).lean()
+        
+        const categoryIds = products.map((p: any) => p.categoryId).filter(Boolean)
+        const categories = await ProductCategory.find({ _id: { $in: categoryIds } }).lean()
+        const categoryMap = new Map(categories.map((c: any) => [c._id.toString(), c]))
+        const assignmentMap = new Map(assignments.map((a: any) => [a.productId.toString(), a]))
+
+        const transformed = products.map((p: any) => {
+          const category = categoryMap.get(p.categoryId?.toString())
+          const assignment = assignmentMap.get(p._id.toString())
+          return {
+            id: p._id.toString(),
+            product_code: p.productCode,
+            name: p.name,
+            description: p.description,
+            category_id: p.categoryId,
+            brand: p.brand,
+            model: p.model,
+            serial_number: p.serialNumber,
+            specifications: p.specifications,
+            status: p.status,
+            created_at: p.createdAt,
+            updated_at: p.updatedAt,
+            category_name: (category as any)?.name,
+            assigned_at: (assignment as any)?.assignedAt,
+            assignment_notes: (assignment as any)?.notes,
+          }
+        })
+
+        return NextResponse.json(transformed)
       }
 
       // Get all catalog products
-      const products = await sql`
-        SELECT 
-          cp.id,
-          cp.product_code,
-          cp.name,
-          cp.description,
-          cp.category_id,
-          cp.brand,
-          cp.model,
-          cp.serial_number,
-          cp.specifications,
-          cp.status,
-          cp.created_at,
-          cp.updated_at,
-          pc.name as category_name
-        FROM catalog_products cp
-        LEFT JOIN product_categories pc ON cp.category_id = pc.id
-        ORDER BY cp.created_at DESC
-      `
-      return NextResponse.json(products)
+      const products = await Product.find().sort({ createdAt: -1 }).lean()
+      
+      const categoryIds = products.map((p: any) => p.categoryId).filter(Boolean)
+      const categories = await ProductCategory.find({ _id: { $in: categoryIds } }).lean()
+      const categoryMap = new Map(categories.map((c: any) => [c._id.toString(), c]))
+
+      const transformed = products.map((p: any) => {
+        const category = categoryMap.get(p.categoryId?.toString())
+        return {
+          id: p._id.toString(),
+          product_code: p.productCode,
+          name: p.name,
+          description: p.description,
+          category_id: p.categoryId,
+          brand: p.brand,
+          model: p.model,
+          serial_number: p.serialNumber,
+          specifications: p.specifications,
+          status: p.status,
+          created_at: p.createdAt,
+          updated_at: p.updatedAt,
+          category_name: (category as any)?.name,
+        }
+      })
+
+      return NextResponse.json(transformed)
     }
 
     return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
   } catch (error) {
     console.error("[v0] Get products error:", error)
-    return NextResponse.json({ message: "Internal server error" }, { status: 500 })
-  }
-}
-
-export async function POST(request: Request) {
-  try {
-    const cookieStore = await cookies()
-    const customerSession = cookieStore.get("customer-session")?.value
-
-    if (!customerSession) {
-      return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
-    }
-
-    const session = JSON.parse(customerSession)
-    const { name, description } = await request.json()
-
-    // Legacy - create product in old products table (if still needed)
-    const result = await sql`
-      INSERT INTO products (customer_id, name, description, status)
-      VALUES (${session.customerId}, ${name}, ${description}, 'active')
-      RETURNING id, name, description, status, created_at, updated_at
-    `
-
-    return NextResponse.json({ product: result[0] }, { status: 201 })
-  } catch (error) {
-    console.error("[v0] Create product error:", error)
     return NextResponse.json({ message: "Internal server error" }, { status: 500 })
   }
 }

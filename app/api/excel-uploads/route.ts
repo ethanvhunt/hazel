@@ -1,11 +1,16 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import ExcelUpload from "@/models/ExcelUpload"
+import { User, ActivityLog } from "@/models"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 import { put } from "@vercel/blob"
 import * as XLSX from "xlsx"
+import mongoose from "mongoose"
 
 export async function GET(request: Request) {
   try {
+    await connectToDatabase()
+    
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")
     const customerSession = cookieStore.get("customer-session")
@@ -21,26 +26,44 @@ export async function GET(request: Request) {
       return NextResponse.json({ message: "Customer ID required" }, { status: 400 })
     }
 
-    const uploads = await sql`
-      SELECT 
-        e.id, e.customer_id, e.file_name, e.file_size, 
-        e.file_type, e.description, e.created_at, e.file_path,
-        u.full_name as uploaded_by_name
-      FROM excel_uploads e
-      LEFT JOIN users u ON e.uploaded_by = u.id
-      WHERE e.customer_id = ${customerId}
-      ORDER BY e.created_at DESC
-    `
+    const uploads = await ExcelUpload.aggregate([
+      { $match: { customerId: new mongoose.Types.ObjectId(customerId) } },
+      {
+        $lookup: {
+          from: "users",
+          localField: "uploadedBy",
+          foreignField: "_id",
+          as: "uploader",
+        },
+      },
+      { $unwind: { path: "$uploader", preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          id: "$_id",
+          customerId: 1,
+          fileName: 1,
+          fileSize: 1,
+          fileType: 1,
+          description: 1,
+          createdAt: 1,
+          filePath: 1,
+          uploadedByName: "$uploader.fullName",
+        },
+      },
+      { $sort: { createdAt: -1 } },
+    ])
 
     return NextResponse.json({ uploads })
   } catch (error) {
-    console.error("[v0] Error fetching Excel uploads:", error)
+    console.error("Error fetching Excel uploads:", error)
     return NextResponse.json({ message: "Error fetching uploads" }, { status: 500 })
   }
 }
 
 export async function POST(request: Request) {
   try {
+    await connectToDatabase()
+    
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")
 
@@ -80,7 +103,7 @@ export async function POST(request: Request) {
       })
       blobUrl = blob.url
     } catch (blobError) {
-      console.error("[v0] Error uploading to Blob storage:", blobError)
+      console.error("Error uploading to Blob storage:", blobError)
       return NextResponse.json({ message: "Error uploading file to storage" }, { status: 500 })
     }
 
@@ -88,46 +111,53 @@ export async function POST(request: Request) {
       const arrayBuffer = await file.arrayBuffer()
       const workbook = XLSX.read(arrayBuffer, { type: "array" })
 
-      const fileSizeInt = Math.floor(file.size)
-      const descriptionText = description || null
-
-      const upload = await sql`
-        INSERT INTO excel_uploads (customer_id, uploaded_by, file_name, file_size, file_path, file_type, description)
-        VALUES (${customerId}::uuid, ${userId}::uuid, ${file.name}::varchar, ${fileSizeInt}::integer, ${blobUrl}::varchar, ${fileExtension}::varchar, ${descriptionText}::text)
-        RETURNING id, file_name, file_size, created_at
-      `
-
-      const uploadId = upload[0].id
-
-      for (const sheetName of workbook.SheetNames) {
+      const sheets = workbook.SheetNames.map((sheetName) => {
         const worksheet = workbook.Sheets[sheetName]
         const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" })
-
-        // Store each row in the database with explicit JSONB type casting
-        for (let i = 0; i < jsonData.length; i++) {
-          const rowData = jsonData[i] as any[]
-          const rowDataJson = JSON.stringify(rowData)
-
-          await sql`
-            INSERT INTO excel_data (excel_upload_id, sheet_name, row_index, row_data)
-            VALUES (${uploadId}::uuid, ${sheetName}::varchar, ${i}::integer, ${rowDataJson}::jsonb)
-          `
+        return {
+          sheetName,
+          data: jsonData as any[][],
         }
-      }
+      })
 
-      const activityData = JSON.stringify({ file_name: file.name, customer_id: customerId })
-      await sql`
-        INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, new_values)
-        VALUES ('excel_upload'::varchar, ${uploadId}::uuid, 'create'::varchar, ${userId}::uuid, ${activityData}::jsonb)
-      `
+      const upload = await ExcelUpload.create({
+        customerId: new mongoose.Types.ObjectId(customerId),
+        uploadedBy: new mongoose.Types.ObjectId(userId),
+        fileName: file.name,
+        fileSize: Math.floor(file.size),
+        filePath: blobUrl,
+        fileType: fileExtension,
+        description: description || undefined,
+        sheets,
+      })
 
-      return NextResponse.json({ message: "File uploaded and parsed successfully", upload: upload[0] }, { status: 201 })
+      await ActivityLog.create({
+        entityType: "excel_upload",
+        entityId: upload._id,
+        action: "create",
+        performedBy: new mongoose.Types.ObjectId(userId),
+        performedByType: "team",
+        newValues: { fileName: file.name, customerId },
+      })
+
+      return NextResponse.json(
+        {
+          message: "File uploaded and parsed successfully",
+          upload: {
+            id: upload._id,
+            fileName: upload.fileName,
+            fileSize: upload.fileSize,
+            createdAt: upload.createdAt,
+          },
+        },
+        { status: 201 }
+      )
     } catch (parseError) {
-      console.error("[v0] Error parsing Excel file:", parseError)
+      console.error("Error parsing Excel file:", parseError)
       return NextResponse.json({ message: "Error parsing Excel file" }, { status: 500 })
     }
   } catch (error) {
-    console.error("[v0] Error uploading Excel file:", error)
+    console.error("Error uploading Excel file:", error)
     return NextResponse.json({ message: "Error uploading file" }, { status: 500 })
   }
 }

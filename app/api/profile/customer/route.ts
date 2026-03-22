@@ -1,4 +1,5 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { Customer } from "@/models"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 
@@ -12,17 +13,26 @@ export async function GET() {
     }
 
     const session = JSON.parse(sessionStr)
-    const customer = await sql`
-      SELECT id, email, company_name, contact_person, phone, created_at, updated_at
-      FROM customers
-      WHERE id = ${session.customerId}
-    `
+    
+    await connectToDatabase()
+    
+    const customer = await Customer.findById(session.customerId).lean()
 
-    if (customer.length === 0) {
+    if (!customer) {
       return NextResponse.json({ message: "Customer not found" }, { status: 404 })
     }
 
-    return NextResponse.json({ customer: customer[0] })
+    return NextResponse.json({
+      customer: {
+        id: (customer as any)._id.toString(),
+        email: (customer as any).email,
+        company_name: (customer as any).companyName,
+        contact_person: (customer as any).contactPerson,
+        phone: (customer as any).phone,
+        created_at: (customer as any).createdAt,
+        updated_at: (customer as any).updatedAt,
+      },
+    })
   } catch (error) {
     console.error("[v0] Get profile error:", error)
     return NextResponse.json({ message: "Internal server error" }, { status: 500 })
@@ -41,11 +51,13 @@ export async function PUT(request: Request) {
     const session = JSON.parse(sessionStr)
     const { contactPerson, phone } = await request.json()
 
-    await sql`
-      UPDATE customers
-      SET contact_person = ${contactPerson}, phone = ${phone}, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ${session.customerId}
-    `
+    await connectToDatabase()
+
+    await Customer.findByIdAndUpdate(session.customerId, {
+      contactPerson,
+      phone,
+      updatedAt: new Date(),
+    })
 
     return NextResponse.json({ success: true, message: "Profile updated" })
   } catch (error) {

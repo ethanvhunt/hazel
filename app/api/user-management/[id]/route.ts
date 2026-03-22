@@ -1,4 +1,6 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { User, CustomerAgentAssignment } from "@/models"
+import { logActivity } from "@/lib/activity-logger"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 import { ROLES } from "@/lib/constants"
@@ -27,17 +29,22 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
       return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
     }
 
-    const users = await sql`
-      SELECT id, email, full_name, role, mobile_number, created_at
-      FROM users
-      WHERE id = ${id}
-    `
+    await connectToDatabase()
 
-    if (users.length === 0) {
+    const user = await User.findById(id).select("-passwordHash").lean()
+
+    if (!user) {
       return NextResponse.json({ message: "User not found" }, { status: 404 })
     }
 
-    return NextResponse.json(users[0])
+    return NextResponse.json({
+      id: (user as any)._id.toString(),
+      email: (user as any).email,
+      full_name: (user as any).fullName,
+      role: (user as any).role,
+      mobile_number: (user as any).mobileNumber,
+      created_at: (user as any).createdAt,
+    })
   } catch (error) {
     console.error("Error fetching user:", error)
     return NextResponse.json({ message: "Internal server error" }, { status: 500 })
@@ -60,16 +67,15 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
 
     const { fullName, email, role, mobileNumber } = await request.json()
 
-    // Fetch current user data
-    const currentUsers = await sql`SELECT * FROM users WHERE id = ${id}`
-    if (currentUsers.length === 0) {
+    await connectToDatabase()
+
+    const currentUser = await User.findById(id).lean()
+    if (!currentUser) {
       return NextResponse.json({ message: "User not found" }, { status: 404 })
     }
 
-    const currentUser = currentUsers[0]
-
     // Non-super_admin cannot modify super_admin users
-    if (currentUser.role === ROLES.SUPER_ADMIN && session.role !== ROLES.SUPER_ADMIN) {
+    if ((currentUser as any).role === ROLES.SUPER_ADMIN && session.role !== ROLES.SUPER_ADMIN) {
       return NextResponse.json({ message: "Cannot modify super admin" }, { status: 403 })
     }
 
@@ -78,36 +84,49 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       return NextResponse.json({ message: "Only super admin can assign super admin role" }, { status: 403 })
     }
 
-    const updatedUsers = await sql`
-      UPDATE users 
-      SET 
-        full_name = ${fullName || currentUser.full_name},
-        email = ${email || currentUser.email},
-        role = ${role || currentUser.role},
-        mobile_number = ${mobileNumber || currentUser.mobile_number}
-      WHERE id = ${id}
-      RETURNING id, email, full_name, role, mobile_number, created_at
-    `
+    const updatedUser = await User.findByIdAndUpdate(
+      id,
+      {
+        fullName: fullName || (currentUser as any).fullName,
+        email: email || (currentUser as any).email,
+        role: role || (currentUser as any).role,
+        mobileNumber: mobileNumber || (currentUser as any).mobileNumber,
+        updatedAt: new Date(),
+      },
+      { new: true }
+    ).select("-passwordHash").lean()
 
     // Log activity
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, old_values, new_values)
-      VALUES ('user', ${id}, 'update', ${session.userId}, ${JSON.stringify({
-        fullName: currentUser.full_name,
-        email: currentUser.email,
-        role: currentUser.role,
-        mobileNumber: currentUser.mobile_number,
-      })}, ${JSON.stringify({
-        fullName: fullName || currentUser.full_name,
-        email: email || currentUser.email,
-        role: role || currentUser.role,
-        mobileNumber: mobileNumber || currentUser.mobile_number,
-      })})
-    `
+    await logActivity({
+      entityType: "user",
+      entityId: id,
+      action: "update",
+      performedBy: session.userId,
+      performedByType: "team",
+      oldValues: {
+        fullName: (currentUser as any).fullName,
+        email: (currentUser as any).email,
+        role: (currentUser as any).role,
+        mobileNumber: (currentUser as any).mobileNumber,
+      },
+      newValues: {
+        fullName: fullName || (currentUser as any).fullName,
+        email: email || (currentUser as any).email,
+        role: role || (currentUser as any).role,
+        mobileNumber: mobileNumber || (currentUser as any).mobileNumber,
+      },
+    })
 
     return NextResponse.json({
       message: "User updated successfully",
-      user: updatedUsers[0],
+      user: {
+        id: (updatedUser as any)._id.toString(),
+        email: (updatedUser as any).email,
+        full_name: (updatedUser as any).fullName,
+        role: (updatedUser as any).role,
+        mobile_number: (updatedUser as any).mobileNumber,
+        created_at: (updatedUser as any).createdAt,
+      },
     })
   } catch (error) {
     console.error("Error updating user:", error)
@@ -129,35 +148,39 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       return NextResponse.json({ message: "Unauthorized. Only super admin can delete users." }, { status: 403 })
     }
 
-    // Get user to delete
-    const users = await sql`SELECT * FROM users WHERE id = ${id}`
-    if (users.length === 0) {
+    await connectToDatabase()
+
+    const userToDelete = await User.findById(id).lean()
+    if (!userToDelete) {
       return NextResponse.json({ message: "User not found" }, { status: 404 })
     }
 
-    const userToDelete = users[0]
-
     // Cannot delete yourself
-    if (userToDelete.id === session.userId) {
+    if ((userToDelete as any)._id.toString() === session.userId) {
       return NextResponse.json({ message: "Cannot delete your own account" }, { status: 400 })
     }
 
     // Remove customer assignments first
-    await sql`DELETE FROM customer_agent_assignment WHERE agent_id = ${id}`
+    await CustomerAgentAssignment.deleteMany({ agentId: id })
 
     // Delete user
-    await sql`DELETE FROM users WHERE id = ${id}`
+    await User.findByIdAndDelete(id)
 
     // Log activity
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, old_values, new_values)
-      VALUES ('user', ${id}, 'delete', ${session.userId}, ${JSON.stringify({
-        id: userToDelete.id,
-        fullName: userToDelete.full_name,
-        email: userToDelete.email,
-        role: userToDelete.role,
-      })}, null)
-    `
+    await logActivity({
+      entityType: "user",
+      entityId: id,
+      action: "delete",
+      performedBy: session.userId,
+      performedByType: "team",
+      oldValues: {
+        id: (userToDelete as any)._id.toString(),
+        fullName: (userToDelete as any).fullName,
+        email: (userToDelete as any).email,
+        role: (userToDelete as any).role,
+      },
+      newValues: null,
+    })
 
     return NextResponse.json({ message: "User deleted successfully" })
   } catch (error) {

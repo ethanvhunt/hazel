@@ -1,11 +1,17 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import Customer from "@/models/Customer"
+import CustomerUser from "@/models/CustomerUser"
+import { logActivity } from "@/lib/activity-logger"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 import { hashPassword } from "@/lib/auth"
+import { sendSMS, formatNewUserSMS } from "@/lib/sms"
 import crypto from "crypto"
 
 export async function POST(request: Request) {
   try {
+    await connectDB()
+    
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")?.value
 
@@ -20,52 +26,126 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "Unauthorized" }, { status: 403 })
     }
 
-    const { companyName, contactPerson, email, phone, products } = await request.json()
+    const { companyName, contactPerson, email, phone, customerAdmin, customerAgents } = await request.json()
 
     if (!companyName || !contactPerson || !email) {
       return NextResponse.json({ message: "Missing required fields" }, { status: 400 })
+    }
+
+    // Check if customer email exists
+    const existingCustomer = await Customer.findOne({ email: email.toLowerCase() })
+    if (existingCustomer) {
+      return NextResponse.json({ message: "Customer with this email already exists" }, { status: 400 })
     }
 
     // Generate random password for customer
     const generatedPassword = crypto.randomBytes(8).toString("hex")
     const passwordHash = hashPassword(generatedPassword)
 
-    const customerResult = await sql`
-      INSERT INTO customers (email, password_hash, company_name, contact_person, phone)
-      VALUES (${email}, ${passwordHash}, ${companyName}, ${contactPerson}, ${phone || null})
-      RETURNING id, email, company_name, contact_person, phone, created_at
-    `
+    const customer = await Customer.create({
+      email: email.toLowerCase(),
+      password_hash: passwordHash,
+      company_name: companyName,
+      contact_person: contactPerson,
+      phone: phone || null,
+      is_active: true,
+    })
 
-    const customerId = customerResult[0].id
+    // Create customer admin user if provided
+    let adminUser = null
+    if (customerAdmin && customerAdmin.email && customerAdmin.mobileNumber) {
+      const adminPassword = crypto.randomBytes(8).toString("hex")
+      const adminPasswordHash = hashPassword(adminPassword)
 
-    if (products && products.length > 0) {
-      for (const product of products) {
-        await sql`
-          INSERT INTO products (customer_id, name, description, status)
-          VALUES (${customerId}, ${product.name}, ${product.description}, 'active')
-        `
+      adminUser = await CustomerUser.create({
+        customer_id: customer._id,
+        email: customerAdmin.email.toLowerCase(),
+        password_hash: adminPasswordHash,
+        full_name: customerAdmin.fullName || contactPerson,
+        mobile_number: customerAdmin.mobileNumber,
+        role: "customer_admin",
+        is_active: true,
+      })
+
+      // Send SMS to customer admin with credentials
+      if (customerAdmin.mobileNumber) {
+        await sendSMS({
+          to: customerAdmin.mobileNumber,
+          message: formatNewUserSMS(customerAdmin.fullName || contactPerson, adminPassword),
+          type: "user_created",
+          relatedId: adminUser._id.toString(),
+        })
       }
     }
 
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, old_values, new_values)
-      VALUES ('customer', ${customerId}, 'create', ${session.userId}, null, ${JSON.stringify({
-        companyName,
-        contactPerson,
+    // Create customer agents if provided
+    const agentUsers = []
+    if (customerAgents && Array.isArray(customerAgents)) {
+      for (const agent of customerAgents) {
+        if (agent.email && agent.mobileNumber) {
+          const agentPassword = crypto.randomBytes(8).toString("hex")
+          const agentPasswordHash = hashPassword(agentPassword)
+
+          const agentUser = await CustomerUser.create({
+            customer_id: customer._id,
+            email: agent.email.toLowerCase(),
+            password_hash: agentPasswordHash,
+            full_name: agent.fullName,
+            mobile_number: agent.mobileNumber,
+            role: "customer_agent",
+            is_active: true,
+          })
+
+          agentUsers.push(agentUser)
+
+          // Send SMS to customer agent with credentials
+          if (agent.mobileNumber) {
+            await sendSMS({
+              to: agent.mobileNumber,
+              message: formatNewUserSMS(agent.fullName, agentPassword),
+              type: "user_created",
+              relatedId: agentUser._id.toString(),
+            })
+          }
+        }
+      }
+    }
+
+    // Log activity
+    await logActivity({
+      entityType: "customer",
+      entityId: customer._id,
+      action: "create",
+      performedBy: session.userId,
+      performedByType: "user",
+      performedByName: session.fullName,
+      newValues: {
+        company_name: companyName,
+        contact_person: contactPerson,
         email,
-      })})
-    `
+        customer_users_created: (adminUser ? 1 : 0) + agentUsers.length,
+      },
+      details: `Created customer ${companyName}`,
+    })
 
     return NextResponse.json(
       {
         message: "Customer created successfully",
-        customer: customerResult[0],
+        customer: {
+          id: customer._id.toString(),
+          email: customer.email,
+          company_name: customer.company_name,
+          contact_person: customer.contact_person,
+          phone: customer.phone,
+          created_at: customer.created_at,
+        },
         generatedPassword,
+        customerUsersCreated: (adminUser ? 1 : 0) + agentUsers.length,
       },
       { status: 201 },
     )
   } catch (error) {
     console.error("[v0] Error creating customer:", error)
-    return NextResponse.json({ message: "Internal server error" }, { status: 500 })
+    return NextResponse.json({ message: "Internal server error", error: String(error) }, { status: 500 })
   }
 }

@@ -1,4 +1,6 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { Product, Customer, CustomerProduct } from "@/models"
+import { logActivity } from "@/lib/activity-logger"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 
@@ -7,13 +9,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   try {
     const { id: productId } = await params
     const cookieStore = await cookies()
-    const session = cookieStore.get("session")?.value
+    const teamSession = cookieStore.get("team-session")?.value
 
-    if (!session) {
+    if (!teamSession) {
       return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
     }
 
-    const sessionData = JSON.parse(session)
+    const sessionData = JSON.parse(teamSession)
     
     if (!["super_admin", "admin", "manager"].includes(sessionData.role)) {
       return NextResponse.json({ message: "Unauthorized" }, { status: 403 })
@@ -25,46 +27,59 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       return NextResponse.json({ message: "Customer ID is required" }, { status: 400 })
     }
 
+    await connectToDatabase()
+
     // Check if product exists
-    const product = await sql`SELECT * FROM products WHERE id = ${productId}`
-    if (product.length === 0) {
+    const product = await Product.findById(productId).lean()
+    if (!product) {
       return NextResponse.json({ message: "Product not found" }, { status: 404 })
     }
 
     // Check if customer exists
-    const customer = await sql`SELECT * FROM customers WHERE id = ${customer_id}`
-    if (customer.length === 0) {
+    const customer = await Customer.findById(customer_id).lean()
+    if (!customer) {
       return NextResponse.json({ message: "Customer not found" }, { status: 404 })
     }
 
     // Check if already assigned
-    const existing = await sql`
-      SELECT * FROM customer_product_assignments 
-      WHERE product_id = ${productId} AND customer_id = ${customer_id}
-    `
-    if (existing.length > 0) {
+    const existing = await CustomerProduct.findOne({
+      productId,
+      customerId: customer_id,
+    })
+    if (existing) {
       return NextResponse.json({ message: "Product already assigned to this customer" }, { status: 400 })
     }
 
-    const result = await sql`
-      INSERT INTO customer_product_assignments (product_id, customer_id, assigned_by, notes)
-      VALUES (${productId}, ${customer_id}, ${sessionData.userId}, ${notes || null})
-      RETURNING *
-    `
+    const assignment = await CustomerProduct.create({
+      productId,
+      customerId: customer_id,
+      assignedBy: sessionData.userId,
+      notes: notes || null,
+    })
 
     // Log activity
-    await sql`
-      INSERT INTO activity_logs (user_id, action, entity_type, entity_id, details)
-      VALUES (
-        ${sessionData.userId}, 
-        'assign', 
-        'product_assignment', 
-        ${result[0].id}, 
-        ${JSON.stringify({ product_id: product[0].product_id, customer: customer[0].company_name })}
-      )
-    `
+    await logActivity({
+      entityType: "product_assignment",
+      entityId: assignment._id.toString(),
+      action: "assign",
+      performedBy: sessionData.userId,
+      performedByType: "team",
+      newValues: {
+        productCode: (product as any).productCode,
+        customer: (customer as any).companyName,
+      },
+    })
 
-    return NextResponse.json({ assignment: result[0] }, { status: 201 })
+    return NextResponse.json({
+      assignment: {
+        id: assignment._id.toString(),
+        product_id: assignment.productId,
+        customer_id: assignment.customerId,
+        assigned_by: assignment.assignedBy,
+        notes: assignment.notes,
+        created_at: assignment.createdAt,
+      },
+    }, { status: 201 })
   } catch (error) {
     console.error("[v0] Assign product error:", error)
     return NextResponse.json({ message: "Internal server error" }, { status: 500 })
@@ -76,13 +91,13 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
   try {
     const { id: productId } = await params
     const cookieStore = await cookies()
-    const session = cookieStore.get("session")?.value
+    const teamSession = cookieStore.get("team-session")?.value
 
-    if (!session) {
+    if (!teamSession) {
       return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
     }
 
-    const sessionData = JSON.parse(session)
+    const sessionData = JSON.parse(teamSession)
     
     if (!["super_admin", "admin", "manager"].includes(sessionData.role)) {
       return NextResponse.json({ message: "Unauthorized" }, { status: 403 })
@@ -95,22 +110,22 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       return NextResponse.json({ message: "Customer ID is required" }, { status: 400 })
     }
 
-    await sql`
-      DELETE FROM customer_product_assignments 
-      WHERE product_id = ${productId} AND customer_id = ${customerId}
-    `
+    await connectToDatabase()
+
+    await CustomerProduct.deleteOne({
+      productId,
+      customerId,
+    })
 
     // Log activity
-    await sql`
-      INSERT INTO activity_logs (user_id, action, entity_type, entity_id, details)
-      VALUES (
-        ${sessionData.userId}, 
-        'unassign', 
-        'product_assignment', 
-        ${productId}, 
-        ${JSON.stringify({ customer_id: customerId })}
-      )
-    `
+    await logActivity({
+      entityType: "product_assignment",
+      entityId: productId,
+      action: "unassign",
+      performedBy: sessionData.userId,
+      performedByType: "team",
+      oldValues: { customerId },
+    })
 
     return NextResponse.json({ message: "Product unassigned successfully" })
   } catch (error) {

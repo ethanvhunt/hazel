@@ -1,9 +1,12 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { Notification } from "@/models"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 
 export async function GET(request: Request) {
   try {
+    await connectToDatabase()
+    
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")
     const customerSession = cookieStore.get("customer-session")
@@ -14,19 +17,17 @@ export async function GET(request: Request) {
     if (teamSession) {
       try {
         const session = JSON.parse(teamSession.value)
-        userId = session.userId // Correct property name
+        userId = session.userId
         userType = "team"
       } catch (e) {
-        console.error("[v0] Error parsing team session:", e)
         return NextResponse.json({ message: "Invalid session" }, { status: 401 })
       }
     } else if (customerSession) {
       try {
         const session = JSON.parse(customerSession.value)
-        userId = session.customerId // Correct property name
+        userId = session.customerId
         userType = "customer"
       } catch (e) {
-        console.error("[v0] Error parsing customer session:", e)
         return NextResponse.json({ message: "Invalid session" }, { status: 401 })
       }
     }
@@ -38,28 +39,17 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url)
     const limit = Number.parseInt(searchParams.get("limit") || "50")
 
-    const notifications = await sql`
-      SELECT 
-        id,
-        user_id,
-        user_type,
-        event_type,
-        entity_type,
-        entity_id,
-        title,
-        message,
-        read,
-        created_at
-      FROM notifications
-      WHERE user_id = ${userId}::uuid
-      AND read = false
-      ORDER BY created_at DESC
-      LIMIT ${limit}
-    `
+    const notifications = await Notification.find({
+      userId,
+      read: false,
+    })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean()
 
     return NextResponse.json(notifications)
   } catch (error) {
-    console.error("[v0] Error fetching notifications:", error)
+    console.error("Error fetching notifications:", error)
     return NextResponse.json({ message: "Error fetching notifications" }, { status: 500 })
   }
 }

@@ -1,10 +1,14 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import User from "@/models/User"
 import { verifyPassword } from "@/lib/auth"
+import { logActivity } from "@/lib/activity-logger"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 
 export async function POST(request: Request) {
   try {
+    await connectDB()
+    
     const body = await request.json()
     const { email, password } = body
 
@@ -12,17 +16,15 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "Email and password are required" }, { status: 400 })
     }
 
-    const users = await sql`
-      SELECT id, email, password_hash, role, full_name
-      FROM users
-      WHERE email = ${email}
-    `
+    const user = await User.findOne({ email: email.toLowerCase() })
 
-    if (users.length === 0) {
+    if (!user) {
       return NextResponse.json({ message: "Invalid credentials" }, { status: 401 })
     }
 
-    const user = users[0]
+    if (!user.is_active) {
+      return NextResponse.json({ message: "Account is deactivated. Contact your admin." }, { status: 401 })
+    }
 
     if (!verifyPassword(password, user.password_hash)) {
       return NextResponse.json({ message: "Invalid credentials" }, { status: 401 })
@@ -32,7 +34,7 @@ export async function POST(request: Request) {
     cookieStore.set(
       "team-session",
       JSON.stringify({
-        userId: user.id,
+        userId: user._id.toString(),
         email: user.email,
         role: user.role,
         fullName: user.full_name,
@@ -46,10 +48,21 @@ export async function POST(request: Request) {
       },
     )
 
+    // Log the login activity
+    await logActivity({
+      entityType: "user",
+      entityId: user._id,
+      action: "login",
+      performedBy: user._id,
+      performedByType: "user",
+      performedByName: user.full_name,
+      details: `User ${user.full_name} logged in`,
+    })
+
     return NextResponse.json({
       success: true,
       message: "Login successful",
-      user: { id: user.id, email: user.email, role: user.role },
+      user: { id: user._id.toString(), email: user.email, role: user.role },
     })
   } catch (error) {
     console.error("[v0] Team login error:", error)

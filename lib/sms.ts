@@ -1,4 +1,5 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import SMSLog from "@/models/SMSLog"
 
 interface SendSMSParams {
   to: string
@@ -14,24 +15,27 @@ interface SMSResponse {
 }
 
 export async function sendSMS({ to, message, type, relatedId }: SendSMSParams): Promise<SMSResponse> {
+  await connectDB()
+  
   const apiKey = process.env.FAST2SMS_API_KEY
 
   // Clean phone number - remove spaces, dashes, and country code if present
   const cleanPhone = to.replace(/[\s-]/g, "").replace(/^\+91/, "")
 
-  // Log the SMS attempt
-  const logResult = await sql`
-    INSERT INTO sms_logs (phone_number, message, sms_type, related_id, status)
-    VALUES (${cleanPhone}, ${message}, ${type}, ${relatedId || null}, 'pending')
-    RETURNING id
-  `
-  const logId = logResult[0]?.id
+  // Create SMS log entry
+  const smsLog = await SMSLog.create({
+    phone_number: cleanPhone,
+    message,
+    sms_type: type,
+    related_id: relatedId || null,
+    status: "pending",
+  })
 
   // If no API key, log and return mock success
   if (!apiKey) {
     console.log(`[SMS Mock] To: ${cleanPhone}, Message: ${message}`)
-    await sql`UPDATE sms_logs SET status = 'mock_sent' WHERE id = ${logId}`
-    return { success: true, messageId: `mock-${logId}` }
+    await SMSLog.findByIdAndUpdate(smsLog._id, { status: "mock_sent" })
+    return { success: true, messageId: `mock-${smsLog._id}` }
   }
 
   try {
@@ -53,27 +57,25 @@ export async function sendSMS({ to, message, type, relatedId }: SendSMSParams): 
     const data = await response.json()
 
     if (data.return === true) {
-      await sql`
-        UPDATE sms_logs 
-        SET status = 'sent', provider_response = ${JSON.stringify(data)}, sent_at = NOW()
-        WHERE id = ${logId}
-      `
+      await SMSLog.findByIdAndUpdate(smsLog._id, {
+        status: "sent",
+        provider_response: data,
+        sent_at: new Date(),
+      })
       return { success: true, messageId: data.request_id }
     } else {
-      await sql`
-        UPDATE sms_logs 
-        SET status = 'failed', provider_response = ${JSON.stringify(data)}
-        WHERE id = ${logId}
-      `
+      await SMSLog.findByIdAndUpdate(smsLog._id, {
+        status: "failed",
+        provider_response: data,
+      })
       return { success: false, error: data.message || "Failed to send SMS" }
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error"
-    await sql`
-      UPDATE sms_logs 
-      SET status = 'failed', provider_response = ${JSON.stringify({ error: errorMessage })}
-      WHERE id = ${logId}
-    `
+    await SMSLog.findByIdAndUpdate(smsLog._id, {
+      status: "failed",
+      provider_response: { error: errorMessage },
+    })
     console.error("[SMS Error]", error)
     return { success: false, error: errorMessage }
   }

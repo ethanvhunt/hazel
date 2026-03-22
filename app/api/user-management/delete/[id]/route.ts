@@ -1,9 +1,12 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import User from "@/models/User"
+import { logActivity } from "@/lib/activity-logger"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 import { ROLES } from "@/lib/constants"
+import mongoose from "mongoose"
 
-async function checkAdminAuth() {
+async function checkSuperAdminAuth() {
   const cookieStore = await cookies()
   const teamSession = cookieStore.get("team-session")
 
@@ -13,6 +16,7 @@ async function checkAdminAuth() {
 
   try {
     const session = JSON.parse(teamSession.value)
+    // Only super_admin can delete users
     if (session.role !== ROLES.SUPER_ADMIN) {
       return null
     }
@@ -24,38 +28,49 @@ async function checkAdminAuth() {
 
 export async function DELETE(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    await connectDB()
+    
     const { id } = await params
-    const session = await checkAdminAuth()
+    const session = await checkSuperAdminAuth()
+    
     if (!session) {
-      return NextResponse.json({ message: "Unauthorized" }, { status: 403 })
+      return NextResponse.json({ message: "Unauthorized. Only super admin can delete users." }, { status: 403 })
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ message: "Invalid user ID" }, { status: 400 })
     }
 
     // Get user to be deleted
-    const users = await sql`SELECT * FROM users WHERE id = ${id}`
-    const userToDelete = users[0]
+    const userToDelete = await User.findById(id).lean()
 
     if (!userToDelete) {
       return NextResponse.json({ message: "User not found" }, { status: 404 })
     }
 
     // Can't delete yourself
-    if (id === session.id) {
+    if (id === session.userId) {
       return NextResponse.json({ message: "Cannot delete your own account" }, { status: 403 })
     }
 
     // Delete user
-    await sql`DELETE FROM users WHERE id = ${id}`
+    await User.findByIdAndDelete(id)
 
     // Log activity
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, old_values, new_values)
-      VALUES ('user', ${id}, 'delete', ${session.id}, ${JSON.stringify({
-        id: userToDelete.id,
-        fullName: userToDelete.full_name,
-        email: userToDelete.email,
-        role: userToDelete.role,
-      })}, null)
-    `
+    await logActivity({
+      entityType: "user",
+      entityId: id,
+      action: "delete",
+      performedBy: session.userId,
+      performedByType: "user",
+      performedByName: session.fullName,
+      oldValues: {
+        full_name: (userToDelete as any).full_name,
+        email: (userToDelete as any).email,
+        role: (userToDelete as any).role,
+      },
+      details: `Deleted user ${(userToDelete as any).full_name}`,
+    })
 
     return NextResponse.json({ message: "User deleted successfully" })
   } catch (error) {

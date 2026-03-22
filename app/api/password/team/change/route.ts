@@ -1,4 +1,6 @@
-import { sql } from "@/lib/db"
+import { connectToDatabase } from "@/lib/mongodb"
+import { User } from "@/models"
+import { logActivity } from "@/lib/activity-logger"
 import { hashPassword, verifyPassword } from "@/lib/auth"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
@@ -37,17 +39,17 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "Only admins can change other users' passwords" }, { status: 403 })
     }
 
-    const user = await sql`
-      SELECT password_hash, role FROM users WHERE id = ${userId}
-    `
+    await connectToDatabase()
 
-    if (user.length === 0) {
+    const user = await User.findById(userId).lean()
+
+    if (!user) {
       return NextResponse.json({ message: "User not found" }, { status: 404 })
     }
 
     // If changing own password, verify old password
     if (!targetUserId) {
-      if (!verifyPassword(oldPassword, user[0].password_hash)) {
+      if (!verifyPassword(oldPassword, (user as any).passwordHash)) {
         return NextResponse.json({ message: "Invalid current password" }, { status: 401 })
       }
     }
@@ -58,16 +60,18 @@ export async function POST(request: Request) {
     }
 
     const newHash = hashPassword(newPassword)
-    await sql`
-      UPDATE users
-      SET password_hash = ${newHash}, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ${userId}
-    `
+    await User.findByIdAndUpdate(userId, {
+      passwordHash: newHash,
+      updatedAt: new Date(),
+    })
 
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by)
-      VALUES ('user', ${userId}, 'password_change', ${session.userId})
-    `
+    await logActivity({
+      entityType: "user",
+      entityId: userId,
+      action: "password_change",
+      performedBy: session.userId,
+      performedByType: "team",
+    })
 
     return NextResponse.json({ success: true, message: "Password changed successfully" })
   } catch (error) {
