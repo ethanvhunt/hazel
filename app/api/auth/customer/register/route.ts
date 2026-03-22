@@ -1,10 +1,14 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import Customer from "@/models/Customer"
 import { hashPassword } from "@/lib/auth"
+import { logActivity } from "@/lib/activity-logger"
 import { NextResponse } from "next/server"
 
 export async function POST(request: Request) {
   try {
-    const { email, password, companyName, contactPerson, phone } = await request.json()
+    await connectDB()
+    
+    const { email, password, companyName, contactPerson, phone, address } = await request.json()
 
     if (!email || !password || !companyName || !contactPerson) {
       return NextResponse.json(
@@ -17,25 +21,46 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "Password must be at least 6 characters" }, { status: 400 })
     }
 
-    const existingCustomers = await sql`
-      SELECT id FROM customers WHERE email = ${email}
-    `
+    // Check if customer already exists
+    const existingCustomer = await Customer.findOne({ email: email.toLowerCase() })
 
-    if (existingCustomers.length > 0) {
+    if (existingCustomer) {
       return NextResponse.json({ message: "Email already exists" }, { status: 400 })
     }
 
     const passwordHash = hashPassword(password)
 
-    const result = await sql`
-      INSERT INTO customers (email, password_hash, company_name, contact_person, phone)
-      VALUES (${email}, ${passwordHash}, ${companyName}, ${contactPerson}, ${phone})
-      RETURNING id, email, company_name, contact_person
-    `
+    // Create customer
+    const customer = await Customer.create({
+      email: email.toLowerCase(),
+      password_hash: passwordHash,
+      company_name: companyName,
+      contact_person: contactPerson,
+      phone: phone || null,
+      address: address || null,
+      is_active: true,
+    })
+
+    // Log activity
+    await logActivity({
+      entityType: "customer",
+      entityId: customer._id,
+      action: "create",
+      performedBy: customer._id,
+      performedByType: "customer",
+      performedByName: companyName,
+      newValues: { email, company_name: companyName },
+      details: `New customer registration: ${companyName}`,
+    })
 
     return NextResponse.json({
       message: "Registration successful",
-      customer: result[0],
+      customer: {
+        id: customer._id.toString(),
+        email: customer.email,
+        company_name: customer.company_name,
+        contact_person: customer.contact_person,
+      },
     })
   } catch (error) {
     console.error("[v0] Registration error:", error)

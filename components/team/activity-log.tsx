@@ -75,6 +75,8 @@ export function ActivityLog() {
       unassign: "bg-pink-100 text-pink-800",
       login: "bg-cyan-100 text-cyan-800",
       logout: "bg-slate-100 text-slate-800",
+      close: "bg-gray-100 text-gray-800",
+      reopen: "bg-sky-100 text-sky-800",
     }
     return colors[action] || "bg-gray-100 text-gray-800"
   }
