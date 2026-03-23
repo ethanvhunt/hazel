@@ -20,9 +20,9 @@ export async function GET(request: Request) {
       const session = JSON.parse(customerSession)
       const cid = customerId || session.customerId
 
-      // Get all product assignments for this customer
-      const assignments = await CustomerProduct.find({ customerId: cid, isActive: true }).lean()
-      const productIds = assignments.map((a: any) => a.productId)
+      // Get all product assignments for this customer using correct field names
+      const assignments = await CustomerProduct.find({ customer_id: cid, is_active: true }).lean()
+      const productIds = assignments.map((a: any) => a.product_id)
 
       let query: any = { _id: { $in: productIds } }
       
@@ -42,7 +42,7 @@ export async function GET(request: Request) {
       const categories = await ProductCategory.find({ _id: { $in: categoryIds } }).lean()
       const categoryMap = new Map(categories.map((c: any) => [c._id.toString(), c]))
 
-      const assignmentMap = new Map(assignments.map((a: any) => [a.productId.toString(), a]))
+      const assignmentMap = new Map(assignments.map((a: any) => [a.product_id.toString(), a]))
 
       const transformed = products.map((p: any) => {
         const category = categoryMap.get(p.categoryId?.toString())
@@ -61,7 +61,7 @@ export async function GET(request: Request) {
           created_at: p.createdAt,
           updated_at: p.updatedAt,
           category_name: (category as any)?.name,
-          assigned_at: (assignment as any)?.assignedAt,
+          assigned_at: (assignment as any)?.assigned_at,
           assignment_notes: (assignment as any)?.notes,
         }
       })
@@ -72,16 +72,16 @@ export async function GET(request: Request) {
     // Team portal - fetch all products or by customer
     if (teamSession) {
       if (customerId) {
-        // Get assigned products for a specific customer
-        const assignments = await CustomerProduct.find({ customerId, isActive: true }).lean()
-        const productIds = assignments.map((a: any) => a.productId)
+        // Get assigned products for a specific customer using correct field names
+        const assignments = await CustomerProduct.find({ customer_id: customerId, is_active: true }).lean()
+        const productIds = assignments.map((a: any) => a.product_id)
         
         const products = await Product.find({ _id: { $in: productIds } }).sort({ name: 1 }).lean()
         
         const categoryIds = products.map((p: any) => p.categoryId).filter(Boolean)
         const categories = await ProductCategory.find({ _id: { $in: categoryIds } }).lean()
         const categoryMap = new Map(categories.map((c: any) => [c._id.toString(), c]))
-        const assignmentMap = new Map(assignments.map((a: any) => [a.productId.toString(), a]))
+        const assignmentMap = new Map(assignments.map((a: any) => [a.product_id.toString(), a]))
 
         const transformed = products.map((p: any) => {
           const category = categoryMap.get(p.categoryId?.toString())
@@ -100,7 +100,7 @@ export async function GET(request: Request) {
             created_at: p.createdAt,
             updated_at: p.updatedAt,
             category_name: (category as any)?.name,
-            assigned_at: (assignment as any)?.assignedAt,
+            assigned_at: (assignment as any)?.assigned_at,
             assignment_notes: (assignment as any)?.notes,
           }
         })
