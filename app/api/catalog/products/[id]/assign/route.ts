@@ -41,19 +41,20 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       return NextResponse.json({ message: "Customer not found" }, { status: 404 })
     }
 
-    // Check if already assigned
+    // Check if already assigned - using correct field names
     const existing = await CustomerProduct.findOne({
-      productId,
-      customerId: customer_id,
+      product_id: productId,
+      customer_id: customer_id,
     })
     if (existing) {
       return NextResponse.json({ message: "Product already assigned to this customer" }, { status: 400 })
     }
 
+    // Create assignment with correct field names matching the model
     const assignment = await CustomerProduct.create({
-      productId,
-      customerId: customer_id,
-      assignedBy: sessionData.userId,
+      product_id: productId,
+      customer_id: customer_id,
+      assigned_by: sessionData.userId,
       notes: notes || null,
     })
 
@@ -73,11 +74,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     return NextResponse.json({
       assignment: {
         id: assignment._id.toString(),
-        product_id: assignment.productId,
-        customer_id: assignment.customerId,
-        assigned_by: assignment.assignedBy,
+        product_id: assignment.product_id,
+        customer_id: assignment.customer_id,
+        assigned_by: assignment.assigned_by,
         notes: assignment.notes,
-        created_at: assignment.createdAt,
+        created_at: assignment.created_at,
       },
     }, { status: 201 })
   } catch (error) {
@@ -112,9 +113,10 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
 
     await connectToDatabase()
 
+    // Use correct field names matching the model
     await CustomerProduct.deleteOne({
-      productId,
-      customerId,
+      product_id: productId,
+      customer_id: customerId,
     })
 
     // Log activity
@@ -124,7 +126,7 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       action: "unassign",
       performedBy: sessionData.userId,
       performedByType: "team",
-      oldValues: { customerId },
+      oldValues: { customer_id: customerId },
     })
 
     return NextResponse.json({ message: "Product unassigned successfully" })
