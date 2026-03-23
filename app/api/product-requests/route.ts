@@ -1,5 +1,5 @@
 import { connectToDatabase } from "@/lib/mongodb"
-import { ProductRequest, Customer, User } from "@/models"
+import { ProductRequest, Customer, User, CustomerUser } from "@/models"
 import { logActivity } from "@/lib/activity-logger"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
@@ -21,6 +21,37 @@ export async function GET(request: Request) {
 
     let requests: any[]
     
+    // Customer portal - fetch requests for their customer account
+    if (customerSession) {
+      let sessionData
+      try {
+        sessionData = JSON.parse(customerSession.value)
+      } catch {
+        return NextResponse.json({ message: "Invalid session" }, { status: 401 })
+      }
+
+      const custId = sessionData.customerId
+      
+      requests = await ProductRequest.find({ customerId: custId }).sort({ createdAt: -1 }).lean()
+      const customer = await Customer.findById(custId).lean()
+      
+      requests = requests.map((r: any) => ({
+        id: r._id.toString(),
+        customer_id: r.customerId,
+        product_name: r.productName,
+        description: r.description,
+        status: r.status,
+        reviewed_by: r.reviewedBy,
+        review_notes: r.reviewNotes,
+        created_at: r.createdAt,
+        updated_at: r.updatedAt,
+        company_name: (customer as any)?.company_name,
+      }))
+
+      return NextResponse.json(requests)
+    }
+    
+    // Team portal
     if (customerId) {
       requests = await ProductRequest.find({ customerId }).sort({ createdAt: -1 }).lean()
       const customer = await Customer.findById(customerId).lean()
@@ -35,7 +66,7 @@ export async function GET(request: Request) {
         review_notes: r.reviewNotes,
         created_at: r.createdAt,
         updated_at: r.updatedAt,
-        company_name: (customer as any)?.companyName,
+        company_name: (customer as any)?.company_name,
       }))
     } else {
       // Fetch all requests for team members
@@ -64,8 +95,8 @@ export async function GET(request: Request) {
           review_notes: r.reviewNotes,
           created_at: r.createdAt,
           updated_at: r.updatedAt,
-          company_name: (customer as any)?.companyName,
-          reviewer_name: (reviewer as any)?.fullName,
+          company_name: (customer as any)?.company_name,
+          reviewer_name: (reviewer as any)?.full_name,
         }
       })
     }
@@ -94,6 +125,7 @@ export async function POST(request: Request) {
     }
 
     const customerId = sessionData.customerId
+    const customerUserId = sessionData.userId // The customer_user who created the request
 
     if (!customerId) {
       return NextResponse.json({ message: "Customer ID not found in session" }, { status: 401 })
@@ -112,15 +144,18 @@ export async function POST(request: Request) {
       productName,
       description,
       status: "pending",
+      createdBy: customerUserId || customerId,
     })
 
     await logActivity({
       entityType: "product_request",
       entityId: newRequest._id.toString(),
       action: "create",
-      performedBy: customerId,
-      performedByType: "customer",
+      performedBy: customerUserId || customerId,
+      performedByType: customerUserId ? "customer_user" : "customer",
+      performedByName: sessionData.fullName || sessionData.companyName,
       newValues: { productName, description },
+      details: `Created product request: ${productName}`,
     })
 
     return NextResponse.json({

@@ -8,7 +8,6 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Textarea } from "@/components/ui/textarea"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Badge } from "@/components/ui/badge"
@@ -22,12 +21,33 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog"
-import { ArrowLeft, Plus, Trash2, Lock } from "lucide-react"
+import { ArrowLeft, Plus, Trash2, Lock, Check, ChevronsUpDown, X, Package } from "lucide-react"
 import { SidebarProvider, SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 import { ExcelUploadsSection } from "@/components/team/excel-uploads-section"
 import { CustomerUsersList } from "@/components/team/customer-users-list"
 import { toast } from "sonner"
+import { cn } from "@/lib/utils"
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command"
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover"
+
+interface CatalogProduct {
+  id: string
+  product_code: string
+  name: string
+  category_name?: string
+}
 
 export default function CustomerDetailPage() {
   const router = useRouter()
@@ -37,6 +57,7 @@ export default function CustomerDetailPage() {
   const [user, setUser] = useState<any>(null)
   const [customer, setCustomer] = useState<any>(null)
   const [products, setProducts] = useState<any[]>([])
+  const [catalogProducts, setCatalogProducts] = useState<CatalogProduct[]>([])
   const [loading, setLoading] = useState(true)
   const [isEditMode, setIsEditMode] = useState(false)
   const [isAddProductOpen, setIsAddProductOpen] = useState(false)
@@ -44,14 +65,13 @@ export default function CustomerDetailPage() {
   const [resetPassword, setResetPassword] = useState("")
   const [confirmPassword, setConfirmPassword] = useState("")
   const [isResettingPassword, setIsResettingPassword] = useState(false)
+  const [selectedProductIds, setSelectedProductIds] = useState<string[]>([])
+  const [productsOpen, setProductsOpen] = useState(false)
+  const [assigningProducts, setAssigningProducts] = useState(false)
   const [editForm, setEditForm] = useState({
     companyName: "",
     contactPerson: "",
     phone: "",
-  })
-  const [productForm, setProductForm] = useState({
-    name: "",
-    description: "",
   })
 
   useEffect(() => {
@@ -62,6 +82,7 @@ export default function CustomerDetailPage() {
     if (user) {
       fetchCustomerDetails()
       fetchProducts()
+      fetchCatalogProducts()
     }
   }, [user, customerId])
 
@@ -131,37 +152,79 @@ export default function CustomerDetailPage() {
     }
   }
 
-  const handleAddProduct = async (e: React.FormEvent) => {
-    e.preventDefault()
+  const fetchCatalogProducts = async () => {
+    try {
+      const response = await fetch("/api/catalog/products", {
+        credentials: "include",
+      })
+      if (response.ok) {
+        const data = await response.json()
+        setCatalogProducts(data)
+      }
+    } catch (error) {
+      console.error("[v0] Error fetching catalog products:", error)
+    }
+  }
 
-    if (!productForm.name.trim() || !productForm.description.trim()) {
-      toast.error("All fields are required")
+  const handleToggleProduct = (productId: string) => {
+    setSelectedProductIds(prev => 
+      prev.includes(productId) 
+        ? prev.filter(id => id !== productId)
+        : [...prev, productId]
+    )
+  }
+
+  const handleRemoveSelectedProduct = (productId: string) => {
+    setSelectedProductIds(prev => prev.filter(id => id !== productId))
+  }
+
+  const handleAssignProducts = async () => {
+    if (selectedProductIds.length === 0) {
+      toast.error("Please select at least one product to assign")
       return
     }
 
-    try {
-      const response = await fetch(`/api/products/team/${customerId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({
-          name: productForm.name,
-          description: productForm.description,
-        }),
-      })
+    setAssigningProducts(true)
+    let successCount = 0
+    let errorCount = 0
 
-      if (response.ok) {
-        toast.success("Product added successfully")
-        setIsAddProductOpen(false)
-        setProductForm({ name: "", description: "" })
-        fetchProducts()
-      } else {
-        const data = await response.json()
-        toast.error(data.message || "Failed to add product")
+    for (const productId of selectedProductIds) {
+      try {
+        const response = await fetch(`/api/catalog/products/${productId}/assign`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            customer_id: customerId,
+          }),
+        })
+
+        if (response.ok) {
+          successCount++
+        } else {
+          const data = await response.json()
+          if (data.message?.includes("already assigned")) {
+            // Skip already assigned products silently
+          } else {
+            errorCount++
+          }
+        }
+      } catch (error) {
+        console.error("[v0] Error assigning product:", error)
+        errorCount++
       }
-    } catch (error) {
-      console.error("[v0] Error adding product:", error)
-      toast.error("Failed to add product")
+    }
+
+    setAssigningProducts(false)
+    setSelectedProductIds([])
+    setIsAddProductOpen(false)
+
+    if (successCount > 0) {
+      toast.success(`Successfully assigned ${successCount} product(s)`)
+      fetchProducts()
+    }
+    if (errorCount > 0) {
+      toast.error(`Failed to assign ${errorCount} product(s)`)
     }
   }
 
@@ -238,23 +301,23 @@ export default function CustomerDetailPage() {
     }
   }
 
-  const handleDeleteProduct = async (productId: string, productName: string) => {
+  const handleUnassignProduct = async (productId: string, productName: string) => {
     try {
-      const response = await fetch(`/api/products/team/${productId}/delete`, {
+      const response = await fetch(`/api/catalog/products/${productId}/assign?customer_id=${customerId}`, {
         method: "DELETE",
         credentials: "include",
       })
 
       if (response.ok) {
-        toast.success(`Product ${productName} deleted successfully`)
+        toast.success(`Product ${productName} unassigned successfully`)
         fetchProducts()
       } else {
         const data = await response.json()
-        toast.error(data.message || "Failed to delete product")
+        toast.error(data.message || "Failed to unassign product")
       }
     } catch (error) {
-      console.error("[v0] Error deleting product:", error)
-      toast.error("Failed to delete product")
+      console.error("[v0] Error unassigning product:", error)
+      toast.error("Failed to unassign product")
     }
   }
 
@@ -266,6 +329,16 @@ export default function CustomerDetailPage() {
     })
     toast.success("Logged out successfully")
     router.push("/team/login")
+  }
+
+  // Get catalog products that are not already assigned
+  const getAvailableProducts = () => {
+    const assignedProductIds = products.map(p => p.catalog_product_id || p.id)
+    return catalogProducts.filter(cp => !assignedProductIds.includes(cp.id))
+  }
+
+  const getSelectedProducts = () => {
+    return catalogProducts.filter(cp => selectedProductIds.includes(cp.id))
   }
 
   if (loading) {
@@ -300,6 +373,8 @@ export default function CustomerDetailPage() {
     return user.role === "super_admin"
   }
 
+  const availableProducts = getAvailableProducts()
+
   return (
     <SidebarProvider>
       <div className="flex h-screen w-full">
@@ -310,7 +385,7 @@ export default function CustomerDetailPage() {
             <h1 className="text-lg font-semibold">Customer Details</h1>
           </header>
           <main className="flex-1 overflow-auto">
-            <div className="p-4 md:p-8">
+            <div className="p-4 md:p-8 w-full">
               {/* Back button and title */}
               <div className="flex items-center gap-4 mb-8">
                 <Button variant="ghost" size="sm" onClick={() => router.back()}>
@@ -321,7 +396,7 @@ export default function CustomerDetailPage() {
               </div>
 
               {/* Tabs for sections */}
-              <Tabs defaultValue="details" className="space-y-4">
+              <Tabs defaultValue="details" className="space-y-4 w-full">
                 <TabsList>
                   <TabsTrigger value="details">Details</TabsTrigger>
                   <TabsTrigger value="products">Products</TabsTrigger>
@@ -479,54 +554,127 @@ export default function CustomerDetailPage() {
                   </Card>
                 </TabsContent>
 
-                <TabsContent value="products" className="space-y-6">
+                <TabsContent value="products" className="space-y-6 w-full">
                   {/* Excel uploads section */}
                   <ExcelUploadsSection customerId={customerId} />
 
-                  {/* Add Product dialog */}
+                  {/* Add Product from Catalog dialog */}
                   {canAddProduct() && (
-                    <Dialog open={isAddProductOpen} onOpenChange={setIsAddProductOpen}>
+                    <Dialog open={isAddProductOpen} onOpenChange={(open) => {
+                      setIsAddProductOpen(open)
+                      if (!open) {
+                        setSelectedProductIds([])
+                      }
+                    }}>
                       <DialogTrigger asChild>
                         <Button size="sm" className="gap-2">
                           <Plus size={16} />
-                          Add Product
+                          Assign Products from Catalog
                         </Button>
                       </DialogTrigger>
-                      <DialogContent>
+                      <DialogContent className="max-w-2xl">
                         <DialogHeader>
-                          <DialogTitle>Add New Product</DialogTitle>
+                          <DialogTitle>Assign Products from Catalog</DialogTitle>
                         </DialogHeader>
-                        <form onSubmit={handleAddProduct} className="space-y-4">
-                          <div>
-                            <Label htmlFor="name">Product Name</Label>
-                            <Input
-                              id="name"
-                              value={productForm.name}
-                              onChange={(e) => setProductForm({ ...productForm, name: e.target.value })}
-                              placeholder="Enter product name"
-                            />
+                        <div className="space-y-4">
+                          {/* Product Selection */}
+                          <div className="space-y-2">
+                            <Label>Select Products</Label>
+                            <Popover open={productsOpen} onOpenChange={setProductsOpen}>
+                              <PopoverTrigger asChild>
+                                <Button
+                                  variant="outline"
+                                  role="combobox"
+                                  aria-expanded={productsOpen}
+                                  className="w-full justify-between"
+                                >
+                                  {selectedProductIds.length > 0
+                                    ? `${selectedProductIds.length} product(s) selected`
+                                    : "Select products..."}
+                                  <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                                </Button>
+                              </PopoverTrigger>
+                              <PopoverContent className="w-full p-0" align="start">
+                                <Command>
+                                  <CommandInput placeholder="Search products..." />
+                                  <CommandList>
+                                    <CommandEmpty>No products available</CommandEmpty>
+                                    <CommandGroup>
+                                      {availableProducts.map((product) => (
+                                        <CommandItem
+                                          key={product.id}
+                                          value={`${product.product_code} ${product.name}`}
+                                          onSelect={() => handleToggleProduct(product.id)}
+                                        >
+                                          <Check
+                                            className={cn(
+                                              "mr-2 h-4 w-4",
+                                              selectedProductIds.includes(product.id) ? "opacity-100" : "opacity-0"
+                                            )}
+                                          />
+                                          <div className="flex flex-col">
+                                            <span className="font-medium">{product.product_code}</span>
+                                            <span className="text-sm text-muted-foreground">{product.name}</span>
+                                            {product.category_name && (
+                                              <span className="text-xs text-muted-foreground">{product.category_name}</span>
+                                            )}
+                                          </div>
+                                        </CommandItem>
+                                      ))}
+                                    </CommandGroup>
+                                  </CommandList>
+                                </Command>
+                              </PopoverContent>
+                            </Popover>
                           </div>
-                          <div>
-                            <Label htmlFor="description">Description</Label>
-                            <Textarea
-                              id="description"
-                              value={productForm.description}
-                              onChange={(e) => setProductForm({ ...productForm, description: e.target.value })}
-                              placeholder="Enter product description"
-                              rows={4}
-                            />
+
+                          {/* Selected Products */}
+                          {selectedProductIds.length > 0 && (
+                            <div className="space-y-2">
+                              <Label>Selected Products</Label>
+                              <div className="flex flex-wrap gap-2 max-h-40 overflow-y-auto p-2 border rounded-md">
+                                {getSelectedProducts().map((product) => (
+                                  <Badge key={product.id} variant="secondary" className="gap-1 py-1">
+                                    <Package className="h-3 w-3" />
+                                    {product.product_code} - {product.name}
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRemoveSelectedProduct(product.id)}
+                                      className="ml-1 hover:bg-muted rounded-full"
+                                    >
+                                      <X className="h-3 w-3" />
+                                    </button>
+                                  </Badge>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          <div className="flex gap-2 justify-end">
+                            <Button
+                              variant="outline"
+                              onClick={() => {
+                                setIsAddProductOpen(false)
+                                setSelectedProductIds([])
+                              }}
+                            >
+                              Cancel
+                            </Button>
+                            <Button 
+                              onClick={handleAssignProducts} 
+                              disabled={assigningProducts || selectedProductIds.length === 0}
+                            >
+                              {assigningProducts ? "Assigning..." : `Assign ${selectedProductIds.length} Product(s)`}
+                            </Button>
                           </div>
-                          <Button type="submit" className="w-full">
-                            Add Product
-                          </Button>
-                        </form>
+                        </div>
                       </DialogContent>
                     </Dialog>
                   )}
 
                   {/* Products table */}
-                  <Card>
-                    <CardHeader className="flex flex-row items-center justify-between">
+                  <Card className="w-full">
+                    <CardHeader>
                       <div>
                         <CardTitle>Products</CardTitle>
                         <CardDescription>Products assigned to this customer</CardDescription>
@@ -539,48 +687,50 @@ export default function CustomerDetailPage() {
                         <Table>
                           <TableHeader>
                             <TableRow>
+                              <TableHead>Product Code</TableHead>
                               <TableHead>Name</TableHead>
-                              <TableHead>Description</TableHead>
+                              <TableHead>Category</TableHead>
                               <TableHead>Status</TableHead>
-                              <TableHead>Created</TableHead>
+                              <TableHead>Assigned</TableHead>
                               <TableHead>Actions</TableHead>
                             </TableRow>
                           </TableHeader>
                           <TableBody>
                             {products.map((product) => (
                               <TableRow key={product.id}>
+                                <TableCell className="font-mono text-sm">{product.product_code || product.name}</TableCell>
                                 <TableCell className="font-medium">{product.name}</TableCell>
-                                <TableCell>{product.description}</TableCell>
+                                <TableCell>{product.category_name || "—"}</TableCell>
                                 <TableCell>
                                   <Badge variant={product.status === "active" ? "default" : "secondary"}>
                                     {product.status}
                                   </Badge>
                                 </TableCell>
-                                <TableCell>{new Date(product.created_at).toLocaleDateString()}</TableCell>
+                                <TableCell>{new Date(product.assigned_at || product.created_at).toLocaleDateString()}</TableCell>
                                 <TableCell>
                                   {canAddProduct() && (
                                     <AlertDialog>
                                       <AlertDialogTrigger asChild>
                                         <Button variant="destructive" size="sm" className="gap-2">
                                           <Trash2 size={16} />
-                                          Delete
+                                          Unassign
                                         </Button>
                                       </AlertDialogTrigger>
                                       <AlertDialogContent>
                                         <AlertDialogHeader>
-                                          <AlertDialogTitle>Delete Product</AlertDialogTitle>
+                                          <AlertDialogTitle>Unassign Product</AlertDialogTitle>
                                           <AlertDialogDescription>
-                                            Are you sure you want to delete {product.name}? This action cannot be
-                                            undone.
+                                            Are you sure you want to unassign {product.name} from this customer? 
+                                            The product will remain in the catalog.
                                           </AlertDialogDescription>
                                         </AlertDialogHeader>
                                         <div className="flex gap-4 justify-end">
                                           <AlertDialogCancel>Cancel</AlertDialogCancel>
                                           <AlertDialogAction
-                                            onClick={() => handleDeleteProduct(product.id, product.name)}
+                                            onClick={() => handleUnassignProduct(product.catalog_product_id || product.id, product.name)}
                                             className="bg-destructive"
                                           >
-                                            Delete
+                                            Unassign
                                           </AlertDialogAction>
                                         </div>
                                       </AlertDialogContent>
@@ -596,7 +746,7 @@ export default function CustomerDetailPage() {
                   </Card>
                 </TabsContent>
 
-                <TabsContent value="users" className="space-y-6">
+                <TabsContent value="users" className="space-y-6 w-full">
                   <CustomerUsersList customerId={customerId} userRole={user.role} />
                 </TabsContent>
               </Tabs>

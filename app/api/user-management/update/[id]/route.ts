@@ -1,7 +1,10 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import User from "@/models/User"
+import { logActivity } from "@/lib/activity-logger"
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 import { ROLES } from "@/lib/constants"
+import mongoose from "mongoose"
 
 async function checkAdminAuth() {
   const cookieStore = await cookies()
@@ -24,24 +27,29 @@ async function checkAdminAuth() {
 
 export async function PUT(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    await connectDB()
+    
     const { id } = await params
     const session = await checkAdminAuth()
     if (!session) {
       return NextResponse.json({ message: "Unauthorized" }, { status: 403 })
     }
 
-    const { fullName, role } = await request.json()
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return NextResponse.json({ message: "Invalid user ID" }, { status: 400 })
+    }
+
+    const { fullName, role, mobile_number, gmail_address } = await request.json()
 
     // Get current user for activity logging
-    const currentUsers = await sql`SELECT * FROM users WHERE id = ${id}`
-    const currentUser = currentUsers[0]
+    const currentUser = await User.findById(id).lean()
 
     if (!currentUser) {
       return NextResponse.json({ message: "User not found" }, { status: 404 })
     }
 
     // Permission check - managers can only modify agents
-    if (session.role === ROLES.MANAGER && currentUser.role !== ROLES.AGENT) {
+    if (session.role === ROLES.MANAGER && (currentUser as any).role !== ROLES.AGENT) {
       return NextResponse.json({ message: "Managers can only modify agents" }, { status: 403 })
     }
 
@@ -57,41 +65,68 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       return NextResponse.json({ message: "Cannot promote to higher role" }, { status: 403 })
     }
 
-    const updates: string[] = []
-    const values: any[] = []
+    // Build update object
+    const updateData: any = {}
+    const oldValues: any = {}
+    const newValues: any = {}
 
-    if (fullName) {
-      updates.push(`full_name = $${updates.length + 1}`)
-      values.push(fullName)
+    if (fullName !== undefined) {
+      oldValues.full_name = (currentUser as any).full_name
+      newValues.full_name = fullName
+      updateData.full_name = fullName
     }
 
-    if (role) {
-      updates.push(`role = $${updates.length + 1}`)
-      values.push(role)
+    if (role !== undefined) {
+      oldValues.role = (currentUser as any).role
+      newValues.role = role
+      updateData.role = role
     }
 
-    if (updates.length === 0) {
+    if (mobile_number !== undefined) {
+      oldValues.mobile_number = (currentUser as any).mobile_number
+      newValues.mobile_number = mobile_number
+      updateData.mobile_number = mobile_number
+    }
+
+    if (gmail_address !== undefined) {
+      oldValues.gmail_address = (currentUser as any).gmail_address
+      newValues.gmail_address = gmail_address
+      updateData.gmail_address = gmail_address
+    }
+
+    if (Object.keys(updateData).length === 0) {
       return NextResponse.json({ message: "No updates provided" }, { status: 400 })
     }
 
-    updates.push(`updated_at = CURRENT_TIMESTAMP`)
-    values.push(id)
-
-    const query = `UPDATE users SET ${updates.join(", ")} WHERE id = $${values.length} RETURNING id, email, full_name, role`
-    const result = await sql(query, values)
+    const updatedUser = await User.findByIdAndUpdate(
+      id,
+      { $set: updateData },
+      { new: true }
+    ).select("-password_hash")
 
     // Log activity
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, old_values, new_values)
-      VALUES ('user', ${id}, 'update', ${session.id}, ${JSON.stringify({
-        fullName: currentUser.full_name,
-        role: currentUser.role,
-      })}, ${JSON.stringify({ fullName, role })})
-    `
+    await logActivity({
+      entityType: "user",
+      entityId: id,
+      action: "update",
+      performedBy: session.userId,
+      performedByType: "user",
+      performedByName: session.fullName,
+      oldValues,
+      newValues,
+      details: `Updated user ${(currentUser as any).email}`,
+    })
 
     return NextResponse.json({
       message: "User updated successfully",
-      user: result[0],
+      user: {
+        id: updatedUser?._id.toString(),
+        email: updatedUser?.email,
+        full_name: updatedUser?.full_name,
+        role: updatedUser?.role,
+        mobile_number: updatedUser?.mobile_number,
+        gmail_address: updatedUser?.gmail_address,
+      },
     })
   } catch (error) {
     console.error("[v0] Error updating user:", error)

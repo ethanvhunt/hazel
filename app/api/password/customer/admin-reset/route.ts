@@ -1,8 +1,11 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import Customer from "@/models/Customer"
 import { hashPassword } from "@/lib/auth"
+import { logActivity } from "@/lib/activity-logger"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 import { ROLES } from "@/lib/constants"
+import mongoose from "mongoose"
 
 async function checkSuperAdminAuth() {
   const cookieStore = await cookies()
@@ -25,6 +28,8 @@ async function checkSuperAdminAuth() {
 
 export async function POST(request: Request) {
   try {
+    await connectDB()
+    
     const session = await checkSuperAdminAuth()
 
     if (!session) {
@@ -45,28 +50,33 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "Password must be at least 6 characters" }, { status: 400 })
     }
 
-    // Check if customer exists
-    const customer = await sql`
-      SELECT id FROM customers WHERE id = ${customerId}
-    `
+    if (!mongoose.Types.ObjectId.isValid(customerId)) {
+      return NextResponse.json({ message: "Invalid customer ID" }, { status: 400 })
+    }
 
-    if (customer.length === 0) {
+    // Check if customer exists
+    const customer = await Customer.findById(customerId)
+
+    if (!customer) {
       return NextResponse.json({ message: "Customer not found" }, { status: 404 })
     }
 
     // Update customer password
     const newHash = hashPassword(newPassword)
-    await sql`
-      UPDATE customers
-      SET password_hash = ${newHash}, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ${customerId}
-    `
+    await Customer.findByIdAndUpdate(customerId, {
+      $set: { password_hash: newHash },
+    })
 
     // Log the action
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by)
-      VALUES ('customer', ${customerId}, 'update', ${session.userId})
-    `
+    await logActivity({
+      entityType: "customer",
+      entityId: customerId,
+      action: "update",
+      performedBy: session.userId,
+      performedByType: "user",
+      performedByName: session.fullName,
+      details: `Admin reset password for customer ${customer.company_name}`,
+    })
 
     return NextResponse.json({ success: true, message: "Customer password reset successfully" })
   } catch (error) {

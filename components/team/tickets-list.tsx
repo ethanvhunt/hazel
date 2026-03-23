@@ -8,6 +8,9 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+import { Calendar } from "@/components/ui/calendar"
+import { format } from "date-fns"
 import { toast } from "sonner"
 import { 
   Trash2, 
@@ -18,7 +21,9 @@ import {
   CheckCircle2, 
   XCircle,
   Filter,
-  ArrowUpRight
+  ArrowUpRight,
+  X,
+  CalendarIcon
 } from "lucide-react"
 import {
   AlertDialog,
@@ -57,21 +62,76 @@ const priorityConfig: Record<string, { label: string; className: string }> = {
 
 export function TicketsList({ userRole }: TicketsListProps) {
   const [tickets, setTickets] = useState<any[]>([])
+  const [filteredTickets, setFilteredTickets] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
-  const [filterStatus, setFilterStatus] = useState<string>("all")
-  const [searchQuery, setSearchQuery] = useState("")
   const [deleting, setDeleting] = useState<string | null>(null)
+
+  // Filters
+  const [searchQuery, setSearchQuery] = useState("")
+  const [filterStatus, setFilterStatus] = useState<string>("all")
+  const [filterPriority, setFilterPriority] = useState<string>("all")
+  const [filterCustomer, setFilterCustomer] = useState<string>("all")
+  const [dateFrom, setDateFrom] = useState<Date | undefined>()
+  const [dateTo, setDateTo] = useState<Date | undefined>()
+
+  // Get unique customers
+  const uniqueCustomers = Array.from(new Set(tickets.filter(t => t.customer_name).map(t => t.customer_name)))
 
   useEffect(() => {
     fetchTickets()
-    const interval = setInterval(fetchTickets, 5000)
+    const interval = setInterval(fetchTickets, 10000)
     return () => clearInterval(interval)
-  }, [filterStatus])
+  }, [])
+
+  useEffect(() => {
+    applyFilters()
+  }, [tickets, searchQuery, filterStatus, filterPriority, filterCustomer, dateFrom, dateTo])
+
+  const applyFilters = () => {
+    let filtered = [...tickets]
+
+    // Search filter
+    if (searchQuery.trim()) {
+      const query = searchQuery.toLowerCase()
+      filtered = filtered.filter((ticket) =>
+        ticket.title?.toLowerCase().includes(query) ||
+        ticket.ticket_number?.toLowerCase().includes(query) ||
+        ticket.customer_name?.toLowerCase().includes(query) ||
+        ticket.description?.toLowerCase().includes(query)
+      )
+    }
+
+    // Status filter
+    if (filterStatus !== "all") {
+      filtered = filtered.filter(t => t.status === filterStatus)
+    }
+
+    // Priority filter
+    if (filterPriority !== "all") {
+      filtered = filtered.filter(t => t.priority === filterPriority)
+    }
+
+    // Customer filter
+    if (filterCustomer !== "all") {
+      filtered = filtered.filter(t => t.customer_name === filterCustomer)
+    }
+
+    // Date filters
+    if (dateFrom) {
+      filtered = filtered.filter(t => new Date(t.created_at) >= dateFrom)
+    }
+    if (dateTo) {
+      const endOfDay = new Date(dateTo)
+      endOfDay.setHours(23, 59, 59, 999)
+      filtered = filtered.filter(t => new Date(t.created_at) <= endOfDay)
+    }
+
+    setFilteredTickets(filtered)
+  }
 
   const fetchTickets = async () => {
     try {
-      const query = filterStatus !== "all" ? `?status=${filterStatus}` : ""
-      const response = await fetch(`/api/tickets${query}`, {
+      const response = await fetch("/api/tickets", {
         credentials: "include",
       })
       if (response.ok) {
@@ -108,22 +168,25 @@ export function TicketsList({ userRole }: TicketsListProps) {
     }
   }
 
-  const filteredTickets = tickets.filter((ticket) => {
-    if (!searchQuery) return true
-    const query = searchQuery.toLowerCase()
-    return (
-      ticket.title?.toLowerCase().includes(query) ||
-      ticket.ticket_number?.toLowerCase().includes(query) ||
-      ticket.customer_name?.toLowerCase().includes(query)
-    )
-  })
+  const clearFilters = () => {
+    setSearchQuery("")
+    setFilterStatus("all")
+    setFilterPriority("all")
+    setFilterCustomer("all")
+    setDateFrom(undefined)
+    setDateTo(undefined)
+  }
+
+  const hasActiveFilters = searchQuery || filterStatus !== "all" || filterPriority !== "all" || 
+    filterCustomer !== "all" || dateFrom || dateTo
 
   if (loading) {
     return (
       <div className="space-y-4">
-        <div className="flex items-center gap-4">
-          <Skeleton className="h-10 w-64" />
-          <Skeleton className="h-10 w-48" />
+        <div className="flex flex-wrap gap-4">
+          <Skeleton className="h-10 flex-1 min-w-[200px]" />
+          <Skeleton className="h-10 w-[140px]" />
+          <Skeleton className="h-10 w-[140px]" />
         </div>
         <div className="space-y-2">
           {[1, 2, 3, 4, 5].map((i) => (
@@ -137,24 +200,26 @@ export function TicketsList({ userRole }: TicketsListProps) {
   return (
     <div className="space-y-4">
       {/* Filters */}
-      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
-        <div className="relative flex-1 max-w-sm">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-          <Input
-            placeholder="Search tickets..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="pl-9"
-          />
-        </div>
-        <div className="flex items-center gap-2">
-          <Filter className="h-4 w-4 text-muted-foreground" />
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-center gap-3">
+          {/* Search */}
+          <div className="relative flex-1 min-w-[200px]">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+            <Input
+              placeholder="Search tickets..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="pl-9"
+            />
+          </div>
+          
+          {/* Status Filter */}
           <Select value={filterStatus} onValueChange={setFilterStatus}>
-            <SelectTrigger className="w-48">
-              <SelectValue placeholder="Filter by status" />
+            <SelectTrigger className="w-[160px]">
+              <SelectValue placeholder="Status" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All Tickets</SelectItem>
+              <SelectItem value="all">All Status</SelectItem>
               <SelectItem value="pending_approval">Pending Approval</SelectItem>
               <SelectItem value="approved">Approved</SelectItem>
               <SelectItem value="open">Open</SelectItem>
@@ -164,6 +229,86 @@ export function TicketsList({ userRole }: TicketsListProps) {
               <SelectItem value="rejected">Rejected</SelectItem>
             </SelectContent>
           </Select>
+          
+          {/* Priority Filter */}
+          <Select value={filterPriority} onValueChange={setFilterPriority}>
+            <SelectTrigger className="w-[130px]">
+              <SelectValue placeholder="Priority" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All Priority</SelectItem>
+              <SelectItem value="low">Low</SelectItem>
+              <SelectItem value="medium">Medium</SelectItem>
+              <SelectItem value="high">High</SelectItem>
+              <SelectItem value="urgent">Urgent</SelectItem>
+            </SelectContent>
+          </Select>
+          
+          {/* Customer Filter */}
+          {uniqueCustomers.length > 0 && (
+            <Select value={filterCustomer} onValueChange={setFilterCustomer}>
+              <SelectTrigger className="w-[160px]">
+                <SelectValue placeholder="Customer" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All Customers</SelectItem>
+                {uniqueCustomers.map((customer) => (
+                  <SelectItem key={customer} value={customer}>
+                    {customer}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+        </div>
+
+        {/* Date Filters */}
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex items-center gap-2">
+            <Filter className="h-4 w-4 text-muted-foreground" />
+            <span className="text-sm text-muted-foreground">Date:</span>
+          </div>
+          
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button variant="outline" size="sm" className={cn("gap-2", dateFrom && "text-foreground")}>
+                <CalendarIcon className="h-4 w-4" />
+                {dateFrom ? format(dateFrom, "MMM dd, yyyy") : "From"}
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent className="w-auto p-0" align="start">
+              <Calendar
+                mode="single"
+                selected={dateFrom}
+                onSelect={setDateFrom}
+                initialFocus
+              />
+            </PopoverContent>
+          </Popover>
+          
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button variant="outline" size="sm" className={cn("gap-2", dateTo && "text-foreground")}>
+                <CalendarIcon className="h-4 w-4" />
+                {dateTo ? format(dateTo, "MMM dd, yyyy") : "To"}
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent className="w-auto p-0" align="start">
+              <Calendar
+                mode="single"
+                selected={dateTo}
+                onSelect={setDateTo}
+                initialFocus
+              />
+            </PopoverContent>
+          </Popover>
+          
+          {hasActiveFilters && (
+            <Button variant="ghost" size="sm" onClick={clearFilters} className="gap-1">
+              <X className="h-4 w-4" />
+              Clear Filters
+            </Button>
+          )}
         </div>
       </div>
 
@@ -180,8 +325,8 @@ export function TicketsList({ userRole }: TicketsListProps) {
           </div>
           <h3 className="text-lg font-medium mb-1">No tickets found</h3>
           <p className="text-sm text-muted-foreground">
-            {searchQuery || filterStatus !== "all" 
-              ? "Try adjusting your search or filters" 
+            {hasActiveFilters 
+              ? "Try adjusting your filters" 
               : "No support tickets have been created yet"
             }
           </p>

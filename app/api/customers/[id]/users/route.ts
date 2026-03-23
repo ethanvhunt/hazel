@@ -1,18 +1,25 @@
-import { connectToDatabase } from "@/lib/mongodb"
-import { CustomerUser } from "@/models"
+import connectDB from "@/lib/mongodb"
+import CustomerUser from "@/models/CustomerUser"
 import { logActivity } from "@/lib/activity-logger"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 import { hashPassword } from "@/lib/auth"
 import { sendSMS, formatNewUserSMS } from "@/lib/sms"
+import mongoose from "mongoose"
 
 // GET all users for a customer
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    await connectDB()
+    
     const { id: customerId } = await params
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")?.value
     const customerSession = cookieStore.get("customer-session")?.value
+
+    if (!mongoose.Types.ObjectId.isValid(customerId)) {
+      return NextResponse.json({ message: "Invalid customer ID" }, { status: 400 })
+    }
 
     // Team members or customer_admin can view users
     let hasAccess = false
@@ -35,22 +42,20 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
       return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
     }
 
-    await connectToDatabase()
-
-    const users = await CustomerUser.find({ customerId })
-      .select("-passwordHash")
-      .sort({ createdAt: -1 })
+    const users = await CustomerUser.find({ customer_id: new mongoose.Types.ObjectId(customerId) })
+      .select("-password_hash")
+      .sort({ created_at: -1 })
       .lean()
 
     // Transform for frontend compatibility
     const transformed = users.map((u: any) => ({
       id: u._id.toString(),
-      full_name: u.fullName,
+      full_name: u.full_name,
       email: u.email,
-      mobile_number: u.mobileNumber,
+      mobile_number: u.mobile_number,
       role: u.role,
-      is_active: u.isActive,
-      created_at: u.createdAt,
+      is_active: u.is_active,
+      created_at: u.created_at,
     }))
 
     return NextResponse.json(transformed)
@@ -63,12 +68,20 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
 // POST - Create a new customer user
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    await connectDB()
+    
     const { id: customerId } = await params
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")?.value
     const customerSession = cookieStore.get("customer-session")?.value
 
-    let createdBy: string | null = null
+    if (!mongoose.Types.ObjectId.isValid(customerId)) {
+      return NextResponse.json({ message: "Invalid customer ID" }, { status: 400 })
+    }
+
+    let performedBy: string | null = null
+    let performedByType: "user" | "customer_user" = "user"
+    let performedByName: string = ""
     let hasAccess = false
     
     // Team members can create users
@@ -76,7 +89,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       const sessionData = JSON.parse(teamSession)
       if (["super_admin", "admin", "manager"].includes(sessionData.role)) {
         hasAccess = true
-        createdBy = sessionData.userId
+        performedBy = sessionData.userId
+        performedByType = "user"
+        performedByName = sessionData.fullName
       }
     }
     
@@ -85,7 +100,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       const custSessionData = JSON.parse(customerSession)
       if (custSessionData.customerId === customerId && custSessionData.role === "customer_admin") {
         hasAccess = true
-        createdBy = custSessionData.userId
+        performedBy = custSessionData.userId
+        performedByType = "customer_user"
+        performedByName = custSessionData.fullName
       }
     }
 
@@ -96,7 +113,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const { full_name, email, mobile_number, role, password } = await request.json()
 
     if (!full_name || !email || !mobile_number || !role) {
-      return NextResponse.json({ message: "All fields are required" }, { status: 400 })
+      return NextResponse.json({ message: "Full name, email, mobile number, and role are required" }, { status: 400 })
+    }
+
+    // Validate mobile number format (basic check)
+    const phoneRegex = /^\+?[\d\s-]{10,}$/
+    if (!phoneRegex.test(mobile_number)) {
+      return NextResponse.json({ message: "Please enter a valid mobile number" }, { status: 400 })
     }
 
     // Validate role
@@ -112,12 +135,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       }
     }
 
-    await connectToDatabase()
-
-    // Check if email already exists
-    const existing = await CustomerUser.findOne({ email })
+    // Check if email already exists for this customer
+    const existing = await CustomerUser.findOne({
+      customer_id: new mongoose.Types.ObjectId(customerId),
+      email: email.toLowerCase(),
+    })
     if (existing) {
-      return NextResponse.json({ message: "Email already exists" }, { status: 400 })
+      return NextResponse.json({ message: "Email already exists for this customer" }, { status: 400 })
     }
 
     // Generate temporary password if not provided
@@ -125,13 +149,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const passwordHash = hashPassword(tempPassword)
 
     const newUser = await CustomerUser.create({
-      customerId,
-      fullName: full_name,
-      email,
-      mobileNumber: mobile_number,
-      passwordHash,
+      customer_id: new mongoose.Types.ObjectId(customerId),
+      full_name,
+      email: email.toLowerCase(),
+      mobile_number,
+      password_hash: passwordHash,
       role,
-      createdBy,
+      is_active: true,
     })
 
     // Send SMS with credentials
@@ -143,27 +167,26 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     })
 
     // Log activity
-    if (teamSession) {
-      const sessionData = JSON.parse(teamSession)
-      await logActivity({
-        entityType: "customer_user",
-        entityId: newUser._id.toString(),
-        action: "create",
-        performedBy: sessionData.userId,
-        performedByType: "team",
-        newValues: { fullName: full_name, role, customerId },
-      })
-    }
+    await logActivity({
+      entityType: "customer_user",
+      entityId: newUser._id,
+      action: "create",
+      performedBy: performedBy || undefined,
+      performedByType,
+      performedByName,
+      newValues: { full_name, role, email },
+      details: `Created customer user ${full_name} with role ${role}`,
+    })
 
     return NextResponse.json({
       user: {
         id: newUser._id.toString(),
-        full_name: newUser.fullName,
+        full_name: newUser.full_name,
         email: newUser.email,
-        mobile_number: newUser.mobileNumber,
+        mobile_number: newUser.mobile_number,
         role: newUser.role,
-        is_active: newUser.isActive,
-        created_at: newUser.createdAt,
+        is_active: newUser.is_active,
+        created_at: newUser.created_at,
       },
       tempPassword,
     }, { status: 201 })

@@ -5,7 +5,7 @@ import mongoose from "mongoose"
 interface LogActivityParams {
   entityType: string
   entityId: string | mongoose.Types.ObjectId
-  action: "create" | "update" | "delete" | "view" | "login" | "logout" | "approve" | "reject" | "assign"
+  action: "create" | "update" | "delete" | "view" | "login" | "logout" | "approve" | "reject" | "assign" | "close" | "reopen"
   performedBy?: string | mongoose.Types.ObjectId
   performedByType: "user" | "customer" | "customer_user" | "system"
   performedByName?: string

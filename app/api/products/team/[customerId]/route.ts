@@ -1,9 +1,18 @@
-import { sql } from "@/lib/db"
+import connectDB from "@/lib/mongodb"
+import CustomerProduct from "@/models/CustomerProduct"
+import CustomerAgentAssignment from "@/models/CustomerAgentAssignment"
+import Product from "@/models/Product"
+import { logActivity } from "@/lib/activity-logger"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
+import { ROLES } from "@/lib/constants"
+import mongoose from "mongoose"
 
+// GET products assigned to a customer (for team view)
 export async function GET(request: Request, { params }: { params: Promise<{ customerId: string }> }) {
   try {
+    await connectDB()
+    
     const { customerId } = await params
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")?.value
@@ -14,33 +23,55 @@ export async function GET(request: Request, { params }: { params: Promise<{ cust
 
     const session = JSON.parse(teamSession)
 
+    if (!mongoose.Types.ObjectId.isValid(customerId)) {
+      return NextResponse.json({ message: "Invalid customer ID" }, { status: 400 })
+    }
+
     // Agent can only view products of assigned customers
-    if (session.role === "agent") {
-      const assignment = await sql`
-        SELECT * FROM customer_agent_assignment
-        WHERE customer_id = ${customerId} AND agent_id = ${session.userId}
-      `
-      if (assignment.length === 0) {
+    if (session.role === ROLES.AGENT) {
+      const assignment = await CustomerAgentAssignment.findOne({
+        customer_id: new mongoose.Types.ObjectId(customerId),
+        agent_id: new mongoose.Types.ObjectId(session.userId),
+      })
+      if (!assignment) {
         return NextResponse.json({ message: "Unauthorized" }, { status: 403 })
       }
     }
 
-    const products = await sql`
-      SELECT id, name, description, status, created_at, updated_at
-      FROM products
-      WHERE customer_id = ${customerId}
-      ORDER BY created_at DESC
-    `
+    // Get products assigned to this customer
+    const assignments = await CustomerProduct.find({
+      customer_id: new mongoose.Types.ObjectId(customerId),
+    })
+      .populate("product_id", "name product_code description status category_id brand model")
+      .sort({ assigned_at: -1 })
+      .lean()
+
+    // Transform for frontend
+    const products = assignments.map((a: any) => ({
+      id: a.product_id?._id?.toString() || a._id.toString(),
+      assignment_id: a._id.toString(),
+      product_code: a.product_id?.product_code || null,
+      name: a.product_id?.name || "Unknown Product",
+      description: a.product_id?.description || null,
+      status: a.product_id?.status || "inactive",
+      brand: a.product_id?.brand || null,
+      model: a.product_id?.model || null,
+      assigned_at: a.assigned_at,
+      notes: a.notes,
+    }))
 
     return NextResponse.json(products)
   } catch (error) {
-    console.error("[v0] Error fetching products:", error)
+    console.error("[v0] Error fetching customer products:", error)
     return NextResponse.json({ message: "Internal server error" }, { status: 500 })
   }
 }
 
+// POST - Assign a product to a customer
 export async function POST(request: Request, { params }: { params: Promise<{ customerId: string }> }) {
   try {
+    await connectDB()
+    
     const { customerId } = await params
     const cookieStore = await cookies()
     const teamSession = cookieStore.get("team-session")?.value
@@ -51,92 +82,138 @@ export async function POST(request: Request, { params }: { params: Promise<{ cus
 
     const session = JSON.parse(teamSession)
 
-    // super_admin, admin, manager can add to any customer. agent only to assigned
-    if (session.role === "agent") {
-      const assignment = await sql`
-        SELECT * FROM customer_agent_assignment
-        WHERE customer_id = ${customerId} AND agent_id = ${session.userId}
-      `
-      if (assignment.length === 0) {
-        return NextResponse.json({ message: "You can only add products to assigned customers" }, { status: 403 })
-      }
+    // Only super_admin, admin, manager can assign products
+    if (![ROLES.SUPER_ADMIN, ROLES.ADMIN, ROLES.MANAGER].includes(session.role)) {
+      return NextResponse.json({ message: "Unauthorized" }, { status: 403 })
     }
 
-    const { name, description } = await request.json()
-
-    if (!name || !description) {
-      return NextResponse.json({ message: "Missing required fields" }, { status: 400 })
+    if (!mongoose.Types.ObjectId.isValid(customerId)) {
+      return NextResponse.json({ message: "Invalid customer ID" }, { status: 400 })
     }
 
-    const result = await sql`
-      INSERT INTO products (customer_id, name, description, status)
-      VALUES (${customerId}, ${name}, ${description}, 'active')
-      RETURNING id, name, description, status, created_at, updated_at
-    `
-
-    // Log activity
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, old_values, new_values)
-      VALUES ('product', ${result[0].id}, 'create', ${session.userId}, null, ${JSON.stringify({ name, description })})
-    `
-
-    return NextResponse.json(result[0], { status: 201 })
-  } catch (error) {
-    console.error("[v0] Error creating product:", error)
-    return NextResponse.json({ message: "Internal server error" }, { status: 500 })
-  }
-}
-
-export async function DELETE(request: Request, { params }: { params: Promise<{ customerId: string }> }) {
-  try {
-    const { customerId } = await params
-    const cookieStore = await cookies()
-    const teamSession = cookieStore.get("team-session")?.value
-
-    if (!teamSession) {
-      return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
-    }
-
-    const session = JSON.parse(teamSession)
-    const { productId } = await request.json()
+    const { productId, notes } = await request.json()
 
     if (!productId) {
       return NextResponse.json({ message: "Product ID is required" }, { status: 400 })
     }
 
-    // Fetch product to verify it belongs to the customer
-    const productResult = await sql`SELECT * FROM products WHERE id = ${productId} AND customer_id = ${customerId}`
-    if (productResult.length === 0) {
+    if (!mongoose.Types.ObjectId.isValid(productId)) {
+      return NextResponse.json({ message: "Invalid product ID" }, { status: 400 })
+    }
+
+    // Check if product exists
+    const product = await Product.findById(productId)
+    if (!product) {
       return NextResponse.json({ message: "Product not found" }, { status: 404 })
     }
 
-    const product = productResult[0]
+    // Check if already assigned
+    const existing = await CustomerProduct.findOne({
+      customer_id: new mongoose.Types.ObjectId(customerId),
+      product_id: new mongoose.Types.ObjectId(productId),
+    })
 
-    // Agent can only delete products from assigned customers
-    if (session.role === "agent") {
-      const assignment = await sql`
-        SELECT * FROM customer_agent_assignment
-        WHERE customer_id = ${customerId} AND agent_id = ${session.userId}
-      `
-      if (assignment.length === 0) {
-        return NextResponse.json({ message: "Unauthorized" }, { status: 403 })
-      }
+    if (existing) {
+      return NextResponse.json({ message: "Product already assigned to this customer" }, { status: 400 })
     }
 
-    // Log activity before deletion
-    await sql`
-      INSERT INTO activity_logs (entity_type, entity_id, action, performed_by, old_values, new_values)
-      VALUES ('product', ${productId}, 'delete', ${session.userId}, ${JSON.stringify({
+    // Create assignment
+    const assignment = await CustomerProduct.create({
+      customer_id: new mongoose.Types.ObjectId(customerId),
+      product_id: new mongoose.Types.ObjectId(productId),
+      assigned_by: new mongoose.Types.ObjectId(session.userId),
+      assigned_at: new Date(),
+      notes: notes || null,
+    })
+
+    // Log activity
+    await logActivity({
+      entityType: "customer_product",
+      entityId: assignment._id,
+      action: "assign",
+      performedBy: session.userId,
+      performedByType: "user",
+      performedByName: session.fullName,
+      newValues: { product_code: product.product_code, product_name: product.name },
+      details: `Assigned product ${product.product_code} to customer`,
+    })
+
+    return NextResponse.json({
+      id: assignment._id.toString(),
+      product_id: productId,
+      customer_id: customerId,
+      assigned_at: assignment.assigned_at,
+      notes: assignment.notes,
+      product: {
+        id: product._id.toString(),
+        product_code: product.product_code,
         name: product.name,
-        description: product.description,
-      })}, null)
-    `
-
-    await sql`DELETE FROM products WHERE id = ${productId}`
-
-    return NextResponse.json({ message: "Product deleted successfully" })
+      },
+    }, { status: 201 })
   } catch (error) {
-    console.error("[v0] Error deleting product:", error)
+    console.error("[v0] Error assigning product:", error)
+    return NextResponse.json({ message: "Internal server error" }, { status: 500 })
+  }
+}
+
+// DELETE - Remove a product assignment
+export async function DELETE(request: Request, { params }: { params: Promise<{ customerId: string }> }) {
+  try {
+    await connectDB()
+    
+    const { customerId } = await params
+    const cookieStore = await cookies()
+    const teamSession = cookieStore.get("team-session")?.value
+
+    if (!teamSession) {
+      return NextResponse.json({ message: "Unauthorized" }, { status: 401 })
+    }
+
+    const session = JSON.parse(teamSession)
+
+    // Only super_admin can remove product assignments
+    if (session.role !== ROLES.SUPER_ADMIN) {
+      return NextResponse.json({ message: "Only super admin can remove product assignments" }, { status: 403 })
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(customerId)) {
+      return NextResponse.json({ message: "Invalid customer ID" }, { status: 400 })
+    }
+
+    const { productId } = await request.json()
+
+    if (!productId || !mongoose.Types.ObjectId.isValid(productId)) {
+      return NextResponse.json({ message: "Valid product ID is required" }, { status: 400 })
+    }
+
+    // Find and delete assignment
+    const assignment = await CustomerProduct.findOneAndDelete({
+      customer_id: new mongoose.Types.ObjectId(customerId),
+      product_id: new mongoose.Types.ObjectId(productId),
+    }).populate("product_id", "product_code name")
+
+    if (!assignment) {
+      return NextResponse.json({ message: "Product assignment not found" }, { status: 404 })
+    }
+
+    // Log activity
+    await logActivity({
+      entityType: "customer_product",
+      entityId: assignment._id,
+      action: "delete",
+      performedBy: session.userId,
+      performedByType: "user",
+      performedByName: session.fullName,
+      oldValues: {
+        product_code: (assignment.product_id as any)?.product_code,
+        product_name: (assignment.product_id as any)?.name,
+      },
+      details: `Removed product assignment`,
+    })
+
+    return NextResponse.json({ message: "Product assignment removed successfully" })
+  } catch (error) {
+    console.error("[v0] Error removing product assignment:", error)
     return NextResponse.json({ message: "Internal server error" }, { status: 500 })
   }
 }

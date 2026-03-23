@@ -8,22 +8,35 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     
     await connectToDatabase()
 
-    // Get all product assignments for this customer
-    const assignments = await CustomerProduct.find({ customerId: id, isActive: true }).lean()
+    // Get all product assignments for this customer - using correct field name
+    const assignments = await CustomerProduct.find({ customer_id: id }).lean()
     
     // Get product details
-    const productIds = assignments.map((a: any) => a.productId)
+    const productIds = assignments.map((a: any) => a.product_id)
     const products = await Product.find({ _id: { $in: productIds } }).lean()
 
-    // Transform for frontend compatibility
-    const transformed = products.map((p: any) => ({
-      id: p._id.toString(),
-      name: p.name,
-      description: p.description,
-      status: p.status,
-      product_code: p.productCode,
-      created_at: p.createdAt,
-    }))
+    // Create a map of assignments for easy lookup
+    const assignmentMap = new Map(
+      assignments.map((a: any) => [a.product_id.toString(), a])
+    )
+
+    // Transform for frontend compatibility with assignment details
+    const transformed = products.map((p: any) => {
+      const assignment = assignmentMap.get(p._id.toString())
+      return {
+        id: p._id.toString(),
+        catalog_product_id: p._id.toString(),
+        name: p.name,
+        description: p.description,
+        status: p.status,
+        product_code: p.productCode,
+        category: p.category,
+        manufacturer: p.manufacturer,
+        model: p.model,
+        created_at: p.createdAt,
+        assigned_at: assignment?.assigned_at || assignment?.created_at,
+      }
+    })
 
     return NextResponse.json(transformed)
   } catch (error) {
